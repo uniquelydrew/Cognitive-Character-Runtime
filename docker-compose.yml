@@ -1,0 +1,91 @@
+name: cognitive-character-runtime
+
+services:
+  ui:
+    build:
+      context: .
+      dockerfile: ui/Dockerfile
+    ports:
+      - "3000:80"
+    depends_on:
+      - orchestrator
+    networks: [cognition]
+
+  orchestrator:
+    build:
+      context: .
+      dockerfile: services/orchestrator/Dockerfile
+    environment:
+      MEMORY_URL: http://memory:8000
+      LEFT_URL: http://left-model:8000
+      RIGHT_URL: http://right-model:8000
+      EXEC_URL: http://executive-model:8000
+    ports:
+      - "8080:8000"
+    depends_on:
+      - memory
+      - left-model
+      - right-model
+      - executive-model
+    networks: [cognition]
+
+  memory:
+    build:
+      context: .
+      dockerfile: services/memory/Dockerfile
+    environment:
+      MEMORY_DATABASE: /data/cognition.db
+      CHARACTER_DIR: /characters
+    volumes:
+      - cognition-data:/data
+      - ./characters:/characters:ro
+    networks: [cognition]
+
+  left-model:
+    build:
+      context: .
+      dockerfile: services/cognitive_worker/Dockerfile
+    environment:
+      COGNITIVE_ROLE: left
+      WORKER_BACKEND: ${LEFT_BACKEND:-mock}
+      MODEL_BASE_URL: ${LEFT_MODEL_BASE_URL:-http://host.docker.internal:11434/v1}
+      MODEL_NAME: ${LEFT_MODEL_NAME:-left-local-model}
+      MODEL_API_KEY: ${LEFT_MODEL_API_KEY:-unused}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks: [cognition]
+
+  right-model:
+    build:
+      context: .
+      dockerfile: services/cognitive_worker/Dockerfile
+    environment:
+      COGNITIVE_ROLE: right
+      WORKER_BACKEND: ${RIGHT_BACKEND:-mock}
+      MODEL_BASE_URL: ${RIGHT_MODEL_BASE_URL:-http://host.docker.internal:11434/v1}
+      MODEL_NAME: ${RIGHT_MODEL_NAME:-right-local-model}
+      MODEL_API_KEY: ${RIGHT_MODEL_API_KEY:-unused}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks: [cognition]
+
+  executive-model:
+    build:
+      context: .
+      dockerfile: services/cognitive_worker/Dockerfile
+    environment:
+      COGNITIVE_ROLE: executive
+      WORKER_BACKEND: ${EXEC_BACKEND:-mock}
+      MODEL_BASE_URL: ${EXEC_MODEL_BASE_URL:-http://host.docker.internal:11434/v1}
+      MODEL_NAME: ${EXEC_MODEL_NAME:-executive-local-model}
+      MODEL_API_KEY: ${EXEC_MODEL_API_KEY:-unused}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks: [cognition]
+
+volumes:
+  cognition-data:
+
+networks:
+  cognition:
+    driver: bridge

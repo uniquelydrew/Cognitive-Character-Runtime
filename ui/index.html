@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Cognitive Character Runtime</title>
+  <style>
+    :root { font-family: Inter, system-ui, sans-serif; color-scheme: dark; }
+    body { margin: 0; background: #111318; color: #e8eaf0; }
+    .app { display: grid; grid-template-rows: auto 1fr; height: 100vh; }
+    header { padding: 12px 16px; border-bottom: 1px solid #30343d; display: flex; gap: 12px; align-items: center; }
+    header strong { margin-right: auto; }
+    select, button, textarea { background: #1b1f27; color: #e8eaf0; border: 1px solid #3b414c; border-radius: 6px; }
+    button { padding: 8px 12px; cursor: pointer; }
+    button:disabled { opacity: .45; cursor: default; }
+    main { display: grid; grid-template-columns: minmax(0, 1fr) 420px; min-height: 0; }
+    .chat { display: grid; grid-template-rows: 1fr auto; min-height: 0; }
+    #messages { overflow: auto; padding: 18px; }
+    .message { max-width: 78%; padding: 10px 12px; margin: 8px 0; border-radius: 10px; white-space: pre-wrap; }
+    .user { margin-left: auto; background: #293246; }
+    .character { background: #23272f; }
+    .composer { border-top: 1px solid #30343d; padding: 12px; display: grid; grid-template-columns: 1fr auto; gap: 10px; }
+    textarea { resize: none; min-height: 58px; padding: 10px; }
+    .debug { border-left: 1px solid #30343d; overflow: auto; padding: 12px; background: #0d0f13; }
+    .panel { margin-bottom: 12px; }
+    .panel h3 { font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: #aeb5c2; }
+    pre { font-size: 12px; line-height: 1.4; white-space: pre-wrap; word-break: break-word; background: #16191f; padding: 10px; border-radius: 6px; }
+    .status { font-size: 12px; color: #aeb5c2; }
+    @media (max-width: 900px) { main { grid-template-columns: 1fr; } .debug { display: none; } }
+  </style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <strong>Cognitive Character Runtime</strong>
+    <label>Character <select id="character"></select></label>
+    <button id="newSession">New interaction</button>
+    <button id="reflect" disabled>Reflect</button>
+    <button id="close" disabled>End interaction</button>
+    <span class="status" id="status">Loading…</span>
+  </header>
+  <main>
+    <section class="chat">
+      <div id="messages"></div>
+      <div class="composer">
+        <textarea id="input" placeholder="Message the active character…"></textarea>
+        <button id="send" disabled>Send</button>
+      </div>
+    </section>
+    <aside class="debug">
+      <div class="panel"><h3>Interaction</h3><pre id="interaction">—</pre></div>
+      <div class="panel"><h3>Left</h3><pre id="left">—</pre></div>
+      <div class="panel"><h3>Right</h3><pre id="right">—</pre></div>
+      <div class="panel"><h3>Executive</h3><pre id="executive">—</pre></div>
+      <div class="panel"><h3>Reflection</h3><pre id="reflection">—</pre></div>
+    </aside>
+  </main>
+</div>
+<script>
+const $ = id => document.getElementById(id);
+let sessionId = null;
+
+async function api(path, options={}) {
+  const res = await fetch('/api' + path, {headers:{'Content-Type':'application/json'}, ...options});
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+function pretty(v) { return JSON.stringify(v, null, 2); }
+function addMessage(text, cls) {
+  const el = document.createElement('div');
+  el.className = 'message ' + cls;
+  el.textContent = text;
+  $('messages').appendChild(el);
+  $('messages').scrollTop = $('messages').scrollHeight;
+}
+function setActive(active) {
+  $('send').disabled = !active;
+  $('reflect').disabled = !active;
+  $('close').disabled = !active;
+}
+
+async function loadCharacters() {
+  const chars = await api('/characters');
+  $('character').innerHTML = '';
+  for (const c of chars) {
+    const o = document.createElement('option');
+    o.value = c.id; o.textContent = c.identity.name || c.id;
+    $('character').appendChild(o);
+  }
+  $('status').textContent = chars.length ? 'Ready' : 'No character primers found';
+}
+
+async function newSession() {
+  const character_id = $('character').value;
+  if (!character_id) return;
+  const s = await api('/sessions', {method:'POST', body:JSON.stringify({character_id})});
+  sessionId = s.id;
+  $('messages').innerHTML = '';
+  ['interaction','left','right','executive','reflection'].forEach(id => $(id).textContent = '—');
+  $('status').textContent = sessionId;
+  setActive(true);
+}
+
+async function send() {
+  const message = $('input').value.trim();
+  if (!message || !sessionId) return;
+  $('input').value = '';
+  addMessage(message, 'user');
+  $('send').disabled = true;
+  try {
+    const out = await api(`/sessions/${sessionId}/chat`, {method:'POST', body:JSON.stringify({message})});
+    addMessage(out.message, 'character');
+    $('interaction').textContent = pretty(out.interaction);
+    $('left').textContent = pretty(out.cognition.left);
+    $('right').textContent = pretty(out.cognition.right);
+    $('executive').textContent = pretty(out.cognition.executive);
+  } catch (e) {
+    addMessage('ERROR: ' + e.message, 'character');
+  } finally {
+    $('send').disabled = false;
+  }
+}
+
+async function reflect() {
+  if (!sessionId) return;
+  const out = await api(`/sessions/${sessionId}/reflect`, {method:'POST', body:'{}'});
+  $('reflection').textContent = pretty(out);
+}
+
+async function closeInteraction() {
+  if (!sessionId) return;
+  const out = await api(`/sessions/${sessionId}/close`, {method:'POST', body:'{}'});
+  $('reflection').textContent = pretty(out.reflection);
+  $('status').textContent = 'Interaction closed';
+  setActive(false);
+  sessionId = null;
+}
+
+$('newSession').onclick = newSession;
+$('send').onclick = send;
+$('reflect').onclick = reflect;
+$('close').onclick = closeInteraction;
+$('input').addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+});
+loadCharacters().catch(e => $('status').textContent = e.message);
+</script>
+</body>
+</html>
