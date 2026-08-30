@@ -1,7 +1,13 @@
 import pytest
 from pydantic import ValidationError
 
-from services.common import ExecutiveTurn, LeftAnalysis, RightAnalysis, output_model_for
+from services.common import (
+    ExecutiveRepeatAssessment,
+    ExecutiveTurn,
+    LeftAnalysis,
+    RightAnalysis,
+    output_model_for,
+)
 
 
 def test_left_contract_rejects_unknown_fields():
@@ -62,3 +68,18 @@ def test_only_executive_can_reflect():
     assert output_model_for("executive", "reflection").__name__ == "ExecutiveReflection"
     with pytest.raises(ValueError):
         output_model_for("left", "reflection")
+
+
+def test_only_executive_can_produce_a_repeat_intent_assessment():
+    assessment = ExecutiveRepeatAssessment.model_validate({
+        "primary_hypothesis": "wants_a_different_angle",
+        "alternative_hypotheses": ["checking_consistency"],
+        "evidence_codes": ["exact_question_repeated"],
+        "response_mode": "new_angle",
+        "confidence": 0.6,
+    })
+
+    assert assessment.response_mode == "new_angle"
+    assert output_model_for("executive", "repeat_assessment").__name__ == "ExecutiveRepeatAssessment"
+    with pytest.raises(ValueError):
+        output_model_for("right", "repeat_assessment")

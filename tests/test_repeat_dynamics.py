@@ -3,7 +3,9 @@ from services.orchestrator.app import (
     derive_repeat_dynamics,
     executive_repeat_review,
     immediate_repeat_lobe_reuse,
+    repeat_intent_fallback,
     response_substantially_repeats_prior_answer,
+    response_substantially_repeats_recent_answers,
 )
 
 
@@ -274,6 +276,24 @@ def test_repeat_reframe_guard_catches_a_close_paraphrase_but_allows_a_new_angle(
         "The dawn watch is where I make that responsibility practical. Is there a particular decision you mean?",
         prior,
     )
+    assert response_substantially_repeats_recent_answers(
+        "The sense of duty and responsibility that comes with being a harbormaster is what truly matters to me.",
+        [
+            "I understand that my duty is my top priority, but what I value most is the sense of duty and responsibility that comes with it.",
+            "We may be talking past each other. What distinction are you looking for?",
+        ],
+    )
+
+
+def test_repeat_intent_fallback_varies_with_the_executive_response_mode():
+    new_angle = repeat_intent_fallback({"response_mode": "new_angle"}, 2)
+    consistency = repeat_intent_fallback({"response_mode": "test_consistency"}, 2)
+    unknown = repeat_intent_fallback({"response_mode": "invite_specificity"}, 2)
+    next_new_angle = repeat_intent_fallback({"response_mode": "new_angle"}, 3)
+
+    assert new_angle != consistency != unknown != next_new_angle
+    assert "broad answer" in unknown
+    assert "circumstance" in consistency
 
 
 def test_rephrased_or_unanswered_turns_do_not_bypass_lobe_reasoning():

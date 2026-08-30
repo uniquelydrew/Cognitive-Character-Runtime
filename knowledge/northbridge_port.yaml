@@ -1,0 +1,65 @@
+classifications:
+  - id: access.public
+    aliases: [public, common knowledge]
+    description: Information ordinarily available to people in the setting.
+  - id: access.local_public
+    parents: [access.public]
+    aliases: [local knowledge]
+    description: Common knowledge among people connected to a particular place.
+  - id: place.coastal_region
+    aliases: [coast, coastal]
+    description: The broader coastal region.
+  - id: place.northbridge
+    parents: [place.coastal_region]
+    aliases: [northbridge]
+    description: Northbridge locality.
+  - id: organization.port_authority
+    aliases: [port authority]
+    description: Northbridge Port Authority affiliation.
+  - id: community.port_staff
+    parents: [organization.port_authority]
+    aliases: [port staff, dock staff, harbor staff]
+    description: Personnel who work port operations.
+  - id: role.harbormaster
+    parents: [community.port_staff]
+    aliases: [harbormaster, harbor master]
+    description: Port operational authority.
+  - id: domain.maritime_operations
+    aliases: [shipping, maritime, vessel, ship]
+    description: Maritime operational knowledge.
+  - id: domain.port_administration
+    parents: [domain.maritime_operations]
+    aliases: [port administration, port operations]
+    description: Port administrative processes.
+  - id: domain.recordkeeping
+    parents: [domain.port_administration]
+    aliases: [records, record, manifest, manifests, paperwork]
+    description: Operational recordkeeping and manifests.
+
+records:
+  - id: northbridge.port_record_delays
+    labels: [place.northbridge, domain.port_administration, domain.recordkeeping]
+    access:
+      require_all: [access.public, place.northbridge]
+    assertions:
+      - Port record processing can be delayed during high traffic or system reconciliation.
+      - A processing delay does not by itself establish that cargo is missing.
+    source: Northbridge public port notices
+
+  - id: northbridge.port_staff_manifest_triage
+    labels: [community.port_staff, domain.port_administration, domain.recordkeeping]
+    access:
+      require_all: [community.port_staff]
+    assertions:
+      - Staff compare loading records, customs clearance, and berth logs when a manifest cannot be located.
+      - Operational staff know to escalate an unresolved discrepancy through the port authority.
+    source: Port Authority operating practice
+
+  - id: northbridge.harbormaster_escalation
+    labels: [role.harbormaster, domain.port_administration, domain.maritime_operations]
+    access:
+      require_all: [role.harbormaster]
+    assertions:
+      - A harbormaster coordinates operational response when a record discrepancy may affect departures or safety.
+      - The role does not establish the cause of a discrepancy without supporting records or investigation.
+    source: Port Authority role charter

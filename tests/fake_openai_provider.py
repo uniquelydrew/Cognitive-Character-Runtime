@@ -42,7 +42,15 @@ def completions(body: dict[str, Any]) -> dict[str, Any]:
     system_prompt = body["messages"][0]["content"]
     interaction = request.get("context", {}).get("interaction", {})
 
-    if "analytic hemisphere" in system_prompt:
+    if request.get("mode") == "repeat_assessment":
+        result = {
+            "primary_hypothesis": "wants_more_specific_context",
+            "alternative_hypotheses": ["checking_consistency"],
+            "evidence_codes": ["repeated_question", "prior_answer_available"],
+            "response_mode": "new_angle",
+            "confidence": 0.6,
+        }
+    elif "analytic hemisphere" in system_prompt:
         result = {
             "topic": interaction.get("topic", "topic.general"),
             "fact_refs": [],

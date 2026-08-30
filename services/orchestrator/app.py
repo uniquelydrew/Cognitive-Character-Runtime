@@ -1,15 +1,21 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import os
 import re
 import time
+import uuid
+from contextlib import asynccontextmanager
+from functools import wraps
 from typing import Any
+from urllib.parse import urlencode
 
 import httpx
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, ValidationError
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
+from fastapi.responses import Response
+from pydantic import BaseModel, Field, ValidationError
 
 from services.common import (
     CharacterDocument,
@@ -28,7 +34,12 @@ MEMORY_URL = os.getenv("MEMORY_URL", "http://memory:8000").rstrip("/")
 LEFT_URL = os.getenv("LEFT_URL", "http://left-model:8000").rstrip("/")
 RIGHT_URL = os.getenv("RIGHT_URL", "http://right-model:8000").rstrip("/")
 EXEC_URL = os.getenv("EXEC_URL", "http://executive-model:8000").rstrip("/")
-WORKER_REQUEST_TIMEOUT_SECONDS = float(os.getenv("WORKER_REQUEST_TIMEOUT_SECONDS", "165"))
+WORKER_REQUEST_TIMEOUT_SECONDS = float(os.getenv("WORKER_REQUEST_TIMEOUT_SECONDS", "90"))
+TURN_TIMEOUT_SECONDS = float(os.getenv("TURN_TIMEOUT_SECONDS", "240"))
+SESSION_QUEUE_TIMEOUT_SECONDS = float(os.getenv("SESSION_QUEUE_TIMEOUT_SECONDS", "15"))
+MAX_CONCURRENT_TURNS = int(os.getenv("MAX_CONCURRENT_TURNS", "2"))
+DEBUG_API_ENABLED = os.getenv("ENABLE_DEBUG_API", "").lower() in {"1", "true", "yes"}
+API_AUTH_TOKEN = os.getenv("API_AUTH_TOKEN", "")
 CONTENT_TOKEN_RE = re.compile(r"[a-z0-9']+")
 CONTENT_STOP_WORDS = {
     "a", "an", "the", "is", "are", "was", "were", "do", "did", "does", "you", "your",
@@ -42,25 +53,60 @@ ANALYSIS_STOP_WORDS = {
     "share", "strategy", "subject", "use",
 }
 
-if WORKER_REQUEST_TIMEOUT_SECONDS <= 0:
-    raise RuntimeError("WORKER_REQUEST_TIMEOUT_SECONDS must be positive")
+if (
+    WORKER_REQUEST_TIMEOUT_SECONDS <= 0
+    or TURN_TIMEOUT_SECONDS <= 0
+    or SESSION_QUEUE_TIMEOUT_SECONDS <= 0
+    or MAX_CONCURRENT_TURNS <= 0
+):
+    raise RuntimeError("Worker, turn, queue, and concurrent-turn limits must be positive")
 
-app = FastAPI(title="Cognitive Character Orchestrator", version="0.1.0")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
+SESSION_TURN_LOCKS: dict[str, asyncio.Lock] = {}
+TURN_CAPACITY = asyncio.Semaphore(MAX_CONCURRENT_TURNS)
+
+app = FastAPI(
+    title="Cognitive Character Orchestrator",
+    version="0.1.0",
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
 )
 
 
+@app.middleware("http")
+async def require_api_key(request: Request, call_next: Any) -> Any:
+    """Protect every externally reachable API operation except liveness checks.
+
+    Docker Compose requires the token and nginx injects it into same-origin UI
+    requests.  Keeping health uncredentialed permits container orchestration to
+    determine readiness without turning operational secrets into health checks.
+    """
+
+    if request.url.path == "/health":
+        return await call_next(request)
+    if not API_AUTH_TOKEN:
+        return JSONResponse(status_code=503, content={"detail": "API authentication is not configured."})
+    supplied = request.headers.get("X-API-Key", "")
+    if not hmac.compare_digest(supplied, API_AUTH_TOKEN):
+        return JSONResponse(status_code=401, content={"detail": "Valid API credentials are required."})
+    return await call_next(request)
+
+
 class SessionCreate(BaseModel):
-    character_id: str
+    character_id: str = Field(min_length=1, max_length=64)
 
 
 class ChatRequest(BaseModel):
-    message: str
+    message: str = Field(min_length=1, max_length=4_000)
+    idempotency_key: str | None = Field(default=None, min_length=8, max_length=128)
+
+
+class ProfileImportRequest(BaseModel):
+    yaml: str = Field(min_length=1, max_length=5_000_000)
+
+
+class ProfileDiffRequest(BaseModel):
+    yaml: str = Field(min_length=1, max_length=5_000_000)
 
 
 class ReflectionResult(BaseModel):
@@ -68,6 +114,51 @@ class ReflectionResult(BaseModel):
     summary: str
     mutation_results: list[dict[str, Any]]
     executive: dict[str, Any]
+
+
+@asynccontextmanager
+async def session_operation_lock(session_id: str):
+    """Provide one lock for chat, reflection, and close operations on a session."""
+
+    lock = SESSION_TURN_LOCKS.setdefault(session_id, asyncio.Lock())
+    try:
+        await asyncio.wait_for(lock.acquire(), timeout=SESSION_QUEUE_TIMEOUT_SECONDS)
+    except TimeoutError as exc:
+        raise HTTPException(409, "Another turn for this conversation is still being processed.") from exc
+    try:
+        yield
+    finally:
+        lock.release()
+
+
+@asynccontextmanager
+async def turn_capacity_lock():
+    """Bound expensive live inference across sessions as well as within one session."""
+
+    try:
+        await asyncio.wait_for(TURN_CAPACITY.acquire(), timeout=SESSION_QUEUE_TIMEOUT_SECONDS)
+    except TimeoutError as exc:
+        raise HTTPException(429, "The character runtime is busy. Please retry shortly.") from exc
+    try:
+        yield
+    finally:
+        TURN_CAPACITY.release()
+
+
+def serialize_turn(handler: Any) -> Any:
+    """Serialise stateful turns per session and bound the full browser-visible wait."""
+
+    @wraps(handler)
+    async def wrapped(session_id: str, *args: Any, **kwargs: Any) -> Any:
+        async with session_operation_lock(session_id):
+            async with turn_capacity_lock():
+                try:
+                    async with asyncio.timeout(TURN_TIMEOUT_SECONDS):
+                        return await handler(session_id, *args, **kwargs)
+                except TimeoutError as exc:
+                    raise HTTPException(504, "This turn exceeded the response time limit. It was not retried automatically.") from exc
+
+    return wrapped
 
 
 def normalize_topic(text: str) -> str:
@@ -148,17 +239,72 @@ def response_substantially_repeats_prior_answer(speech: str, prior_speech: str) 
     if len(speech_terms) < 3 or len(prior_terms) < 3:
         return False
     shared = len(speech_terms & prior_terms)
-    return shared >= 3 and (shared / min(len(speech_terms), len(prior_terms))) >= 0.60
+    return shared >= 3 and (shared / min(len(speech_terms), len(prior_terms))) >= 0.50
 
 
-def repeat_reframe_fallback(posture: str) -> str:
-    """Safe last resort if the executive ignores two explicit reframe requests."""
+def response_substantially_repeats_recent_answers(speech: str, prior_speeches: list[str]) -> bool:
+    """Keep repeat deliberation from cycling back to an earlier answer."""
 
-    if posture == "defensive":
-        return "I've answered that. What specific part are you trying to clarify?"
-    if posture == "confused":
-        return "I may be missing what you need from that question. Which part should I clarify?"
-    return "I want to make sure I address what you need. Which part would you like me to clarify?"
+    return any(
+        response_substantially_repeats_prior_answer(speech, prior_speech)
+        for prior_speech in prior_speeches
+        if prior_speech.strip()
+    )
+
+
+def repeat_intent_fallback(assessment: dict[str, Any], consecutive_repeats: int) -> str:
+    """Last-resort response tied to the Executive's chosen repeat hypothesis.
+
+    A tiny local model can still echo after a planned revision.  This guard keeps
+    the visible response distinct without collapsing every failed retry into the
+    same generic clarification phrase.  It is only used after the assessment and
+    two Executive speech attempts have both completed.
+    """
+
+    response_mode = str(assessment.get("response_mode") or "")
+    primary = str(assessment.get("primary_hypothesis") or "")
+    # The stage deliberately advances with the repeat streak. That gives a
+    # character several reasonable interpretations to try before treating the
+    # user as adversarial, instead of restating one static question forever.
+    stage = max(consecutive_repeats - 2, 0) % 4
+
+    if response_mode == "test_consistency" or "consisten" in primary:
+        variants = [
+            "If you are checking whether my answer changes when you ask again, it does not. Is there a circumstance you want to test?",
+            "My answer is consistent. Are you trying to see whether a different situation would change it?",
+            "I cannot tell whether you are testing my consistency or looking for more detail. Which is it?",
+            "If consistency is the point, I have been clear. Tell me what condition you think might alter the answer.",
+        ]
+        return variants[stage]
+
+    if response_mode == "check_understanding" or any(key in primary for key in ("understand", "clear")):
+        variants = [
+            "I may not have explained the point clearly. Do you want the principle, or an example of it in practice?",
+            "Perhaps I have answered too broadly. Which word or part of the answer is unclear?",
+            "We may be using the same words for different questions. What do you mean by it here?",
+            "I do not want to keep guessing at the gap. Name the part you want me to unpack.",
+        ]
+        return variants[stage]
+
+    if response_mode == "set_boundary":
+        variants = [
+            "I've answered the question directly. If you mean something more specific, say which part you want to examine.",
+            "I can approach the subject another way, but repeating the same words does not tell me what is missing.",
+            "If you are looking for a different answer, be direct about the distinction you want to explore.",
+            "I have tried to meet the question as asked. Tell me the actual point you want to press.",
+        ]
+        return variants[stage]
+
+    # New angle and invitation modes share a progression from offering a useful
+    # distinction, through checking the user's frame, to explicitly requesting
+    # the missing distinction. This is not an emotional escalation on its own.
+    variants = [
+        "Perhaps the broad answer is not the useful one. Are you asking what I value, or how that value guides a decision?",
+        "It sounds as though the principle alone is not enough. Do you want to know how it guides a decision, or whether another concern can outrank it?",
+        "We may be talking past each other. Are you asking about the value itself, the work it leads me to do, or a situation where it is tested?",
+        "If the answer is still not reaching you, tell me what distinction you need me to make.",
+    ]
+    return variants[stage]
 
 
 def _clamp(value: float) -> float:
@@ -520,6 +666,18 @@ async def put_json(client: httpx.AsyncClient, url: str, payload: Any) -> Any:
     return r.json()
 
 
+async def get_text(client: httpx.AsyncClient, url: str) -> httpx.Response:
+    try:
+        response = await client.get(url)
+    except httpx.TimeoutException as exc:
+        raise HTTPException(504, "The profile export took too long. Please retry.") from exc
+    except httpx.RequestError as exc:
+        raise HTTPException(503, "The profile export service is unavailable. Please retry shortly.") from exc
+    if response.status_code >= 400:
+        raise HTTPException(response.status_code, _upstream_detail(response))
+    return response
+
+
 def _upstream_detail(response: httpx.Response) -> str:
     """Preserve a worker's safe error message instead of leaking JSON as a string."""
 
@@ -579,10 +737,9 @@ async def health() -> dict[str, Any]:
             get_json(client, f"{EXEC_URL}/health"),
             return_exceptions=True,
         )
-    return {
-        "status": "ok" if all(not isinstance(x, Exception) for x in checks) else "degraded",
-        "dependencies": [str(x) if isinstance(x, Exception) else x for x in checks],
-    }
+    # Liveness must not disclose provider URLs, model names, or internal errors
+    # to an unauthenticated health probe.
+    return {"status": "ok" if all(not isinstance(x, Exception) for x in checks) else "degraded"}
 
 
 @app.get("/characters")
@@ -625,6 +782,37 @@ async def update_profile(character_id: str, profile: CharacterDocument) -> Any:
         )
 
 
+@app.get("/profiles/{character_id}/export")
+async def export_profile(character_id: str) -> Response:
+    async with httpx.AsyncClient(timeout=30) as client:
+        upstream = await get_text(client, f"{MEMORY_URL}/profiles/{character_id}/export")
+    return Response(
+        content=upstream.content,
+        media_type=upstream.headers.get("content-type", "application/yaml"),
+        headers={
+            "Content-Disposition": upstream.headers.get(
+                "content-disposition", f'attachment; filename="{character_id}.snapshot.yaml"'
+            )
+        },
+    )
+
+
+@app.post("/profiles/import")
+async def import_profile(request: ProfileImportRequest) -> Any:
+    async with httpx.AsyncClient(timeout=30) as client:
+        return await post_json(client, f"{MEMORY_URL}/profiles/import", request.model_dump())
+
+
+@app.post("/profiles/{character_id}/diff")
+async def diff_profile(character_id: str, request: ProfileDiffRequest) -> Any:
+    async with httpx.AsyncClient(timeout=30) as client:
+        return await post_json(
+            client,
+            f"{MEMORY_URL}/profiles/{character_id}/diff",
+            request.model_dump(),
+        )
+
+
 @app.post("/sessions")
 async def create_session(req: SessionCreate) -> Any:
     async with httpx.AsyncClient(timeout=20) as client:
@@ -638,6 +826,7 @@ async def session_events(session_id: str) -> Any:
 
 
 @app.post("/sessions/{session_id}/chat")
+@serialize_turn
 async def chat(session_id: str, req: ChatRequest) -> dict[str, Any]:
     if not req.message.strip():
         raise HTTPException(400, "Message cannot be empty")
@@ -653,43 +842,115 @@ async def chat(session_id: str, req: ChatRequest) -> dict[str, Any]:
         character, state = await load_character(client, character_id)
 
         topic = normalize_topic(req.message)
-        history = await get_json(client, f"{MEMORY_URL}/interaction-history/{character_id}?topic={topic}&limit=30")
-        prior_times = int(history.get("times_asked", 0))
-        prior_answer = history.get("prior_answer")
+        prior_transcript = await get_json(client, f"{MEMORY_URL}/sessions/{session_id}/events?limit=200")
+        replies_by_user = {
+            str(event.get("metadata", {}).get("responds_to")): event
+            for event in prior_transcript
+            if event.get("event_type") == "character_message"
+            and isinstance(event.get("metadata"), dict)
+            and event["metadata"].get("responds_to")
+        }
+        completed_session_questions = [
+            event
+            for event in prior_transcript
+            if event.get("event_type") == "user_message"
+            and event.get("topic") == topic
+            and str(event.get("id")) in replies_by_user
+        ]
+        prior_times = len(completed_session_questions)
+        prior_answer = None
+        for event in reversed(prior_transcript):
+            if event.get("event_type") == "character_message" and event.get("topic") == topic:
+                prior_answer = event.get("content")
+                break
         classification = InteractionClassification(
             interaction_type="repeated_question" if prior_times > 0 else "new_subject",
             topic=topic,
             prior_answer=prior_answer,
             times_asked=prior_times + 1,
-            related_event_ids=[e["id"] for e in history.get("events", [])],
+            related_event_ids=[str(event["id"]) for event in completed_session_questions],
         )
-        prior_transcript = await get_json(client, f"{MEMORY_URL}/sessions/{session_id}/events")
+        existing_idempotent_user: dict[str, Any] | None = None
+        if req.idempotency_key:
+            for event in prior_transcript:
+                metadata = event.get("metadata", {})
+                if (
+                    event.get("event_type") == "user_message"
+                    and isinstance(metadata, dict)
+                    and metadata.get("idempotency_key") == req.idempotency_key
+                ):
+                    if event.get("content") != req.message:
+                        raise HTTPException(409, "This idempotency key was already used for a different message.")
+                    existing_idempotent_user = event
+                    break
+            if existing_idempotent_user:
+                matching_reply = next(
+                    (
+                        event
+                        for event in prior_transcript
+                        if event.get("event_type") == "character_message"
+                        and isinstance(event.get("metadata"), dict)
+                        and event["metadata"].get("responds_to") == existing_idempotent_user.get("id")
+                    ),
+                    None,
+                )
+                if matching_reply:
+                    metadata = matching_reply.get("metadata", {})
+                    return {
+                        "session_id": session_id,
+                        "character_id": character_id,
+                        "message": matching_reply.get("content", ""),
+                        "interaction": metadata.get("interaction", {}),
+                        "cognition": {
+                            "left": metadata.get("left", {}),
+                            "right": metadata.get("right", {}),
+                            "executive": metadata.get("executive", {}),
+                            "lobe_execution": metadata.get("lobe_execution", {}),
+                            "timing_ms": {"replayed": True},
+                        },
+                        "memory_writes": [],
+                        "mutation_results": [],
+                        "idempotent_replay": True,
+                    }
         lobe_reuse = immediate_repeat_lobe_reuse(
             message=req.message,
             topic=topic,
             session_events=prior_transcript,
         )
 
-        user_event = EventRecord(
-            character_id=character_id,
-            session_id=session_id,
-            event_type="user_message",
-            actor="user",
-            content=req.message,
-            topic=topic,
-            metadata={"interaction": classification.model_dump(mode="json")},
-        )
-        user_event = EventRecord.model_validate(
-            await post_json(client, f"{MEMORY_URL}/events", user_event.model_dump(mode="json"))
-        )
+        if existing_idempotent_user:
+            user_event = EventRecord.model_validate(existing_idempotent_user)
+        else:
+            user_event = EventRecord(
+                character_id=character_id,
+                session_id=session_id,
+                event_type="user_message",
+                actor="user",
+                content=req.message,
+                topic=topic,
+                metadata={
+                    "interaction": classification.model_dump(mode="json"),
+                    "idempotency_key": req.idempotency_key,
+                },
+            )
+            user_event = EventRecord.model_validate(
+                await post_json(client, f"{MEMORY_URL}/events", user_event.model_dump(mode="json"))
+            )
 
         memories = await get_json(client, f"{MEMORY_URL}/memories/{character_id}?topic={topic}&limit=20")
+        knowledge_query = urlencode({"query": req.message, "limit": 12})
+        knowledge_context = await get_json(
+            client, f"{MEMORY_URL}/knowledge/for-character/{character_id}?{knowledge_query}"
+        )
         common_context = {
             "interaction": classification.model_dump(mode="json"),
             "memories": memories,
             "mutable_state": state.get("mutable_state", {}),
             "beliefs": state.get("beliefs", {}),
             "goals": state.get("goals", []),
+            # This is a label-authorized view of the static general corpus. Raw
+            # corpus records and denied classifications never reach a model.
+            "general_knowledge": knowledge_context.get("items", []),
         }
         cognition_req = CognitiveRequest(character=character, user_input=req.message, context=common_context)
 
@@ -713,7 +974,7 @@ async def chat(session_id: str, req: ChatRequest) -> dict[str, Any]:
         # executive receives a separate, bounded review after both are complete so
         # it can recognize a rephrased repeat without making either lobe suppress
         # its own reasoning.
-        transcript = await get_json(client, f"{MEMORY_URL}/sessions/{session_id}/events")
+        transcript = await get_json(client, f"{MEMORY_URL}/sessions/{session_id}/events?limit=200")
         repeat_review = executive_repeat_review(
             message=req.message,
             topic=topic,
@@ -757,21 +1018,21 @@ async def chat(session_id: str, req: ChatRequest) -> dict[str, Any]:
         )
 
         prior_repeated_speech = str(
-            lobe_reuse.get("prior_speech") if lobe_reuse else repeat_review.get("matched_answer") or ""
+            lobe_reuse.get("prior_speech", "") if lobe_reuse else repeat_review.get("matched_answer", "")
         ).strip()
-        repeat_reframe = {
-            "required": bool(lobe_reuse and prior_repeated_speech),
+        repeat_deliberation = {
+            "enabled": bool(repeat_dynamics.semantic_repeat and prior_repeated_speech),
             # A bounded copy lets the Executive compare its answer without adding
-            # unbounded transcript history to the repeat fast path.
+            # unbounded transcript history to the repeat path.
             "previous_speech": prior_repeated_speech[:1600],
-            "allowed_moves": [
-                "answer from a different established facet",
-                "acknowledge and clarify the user's intended detail",
-                "set a concise, proportionate boundary",
-            ],
         }
-        if repeat_reframe["required"]:
-            lobe_execution["repeat_reframe_required"] = True
+        prior_repeat_speeches = [
+            str(turn.get("content") or "")
+            for turn in repeat_review.get("recent_turns", [])
+            if turn.get("event_type") == "character_message"
+        ]
+        if repeat_deliberation["enabled"]:
+            lobe_execution["repeat_deliberation_required"] = True
 
         executive_mutable_state = dict(state.get("mutable_state", {}))
         executive_mutable_state["topic_defensiveness"] = state.get("mutable_state", {}).get(
@@ -783,9 +1044,33 @@ async def chat(session_id: str, req: ChatRequest) -> dict[str, Any]:
             "conversation_dynamics": repeat_dynamics.model_dump(mode="json"),
             "executive_repeat_review": repeat_review,
             "lobe_execution": lobe_execution,
-            "repeat_reframe": repeat_reframe,
+            "repeat_deliberation": repeat_deliberation,
             "mutable_state": executive_mutable_state,
         }
+        repeat_assessment: dict[str, Any] | None = None
+        repeat_assessment_ms = 0
+        if repeat_deliberation["enabled"]:
+            # Repeated questions deserve a separate Executive-only assessment of
+            # plausible intent. This replaces the old canned reframe fallback and
+            # leaves the two lobe calls skipped for immediate exact repeats.
+            assessment_context = {
+                **executive_context,
+                "repeat_deliberation": {**repeat_deliberation, "phase": "assessment"},
+            }
+            assessment_req = cognition_req.model_copy(
+                update={
+                    "context": assessment_context,
+                    "left_result": left_result,
+                    "right_result": right_result,
+                    "mode": "repeat_assessment",
+                }
+            )
+            repeat_assessment, repeat_assessment_ms = await infer_timed(
+                client, EXEC_URL, assessment_req, "executive"
+            )
+            repeat_deliberation["assessment"] = repeat_assessment
+
+        executive_context["repeat_deliberation"] = repeat_deliberation
         exec_req = cognition_req.model_copy(
             update={
                 "context": executive_context,
@@ -799,43 +1084,42 @@ async def chat(session_id: str, req: ChatRequest) -> dict[str, Any]:
             raise HTTPException(502, "Executive produced no speech")
         executive = {**executive, "speech": speech}
 
-        reframe_retry_ms = 0
-        reframe_retry_used = False
-        reframe_fallback_used = False
-        if repeat_reframe["required"] and response_substantially_repeats_prior_answer(
-            speech, prior_repeated_speech
+        repeat_revision_ms = 0
+        repeat_revision_used = False
+        intent_fallback_used = False
+        if repeat_deliberation["enabled"] and response_substantially_repeats_recent_answers(
+            speech, prior_repeat_speeches
         ):
-            # Preserve the saved lobe work, but give the Executive one focused
-            # chance to correct an answer that merely echoes what the user saw.
-            reframe_retry_used = True
-            retry_reframe = {
-                **repeat_reframe,
-                "previous_attempt": speech[:1600],
-                "retry_reason": (
-                    "The previous attempt substantially repeated previous_speech. "
-                    "Return a distinct reframe, a focused clarification question, "
-                    "or a proportionate boundary."
-                ),
+            # The assessment is preserved for a second, higher-budget Executive
+            # response. It should revise the chosen hypothesis-driven action,
+            # rather than falling through to a generic clarification line.
+            repeat_revision_used = True
+            retry_deliberation = {
+                **repeat_deliberation,
+                "rejected_speech": speech[:1600],
             }
-            retry_context = {**executive_context, "repeat_reframe": retry_reframe}
+            retry_context = {**executive_context, "repeat_deliberation": retry_deliberation}
             retry_req = exec_req.model_copy(update={"context": retry_context})
-            executive, reframe_retry_ms = await infer_timed(client, EXEC_URL, retry_req, "executive")
-            executive_ms += reframe_retry_ms
+            executive, repeat_revision_ms = await infer_timed(client, EXEC_URL, retry_req, "executive")
+            executive_ms += repeat_revision_ms
             speech = str(executive.get("speech", "")).strip()
             if not speech:
-                raise HTTPException(502, "Executive produced no speech on repeat reframe retry")
+                raise HTTPException(502, "Executive produced no speech on repeat deliberation revision")
             executive = {**executive, "speech": speech}
-            if response_substantially_repeats_prior_answer(speech, prior_repeated_speech):
-                # This is a deliberately neutral safety net, not an emotional
-                # escalation. The Executive's selected escalation still controls
-                # the durable defensiveness gauge below.
-                speech = repeat_reframe_fallback(repeat_dynamics.response_posture)
+            if response_substantially_repeats_recent_answers(speech, prior_repeat_speeches):
+                # The emergency response follows the Executive's response mode,
+                # so it cannot collapse the entire conversation into one stock
+                # phrase. The Executive still owns emotional escalation below.
+                speech = repeat_intent_fallback(
+                    repeat_assessment or {}, repeat_dynamics.consecutive_repeats
+                )
                 executive = {**executive, "speech": speech}
-                reframe_fallback_used = True
-        lobe_execution["repeat_reframe"] = {
-            "required": repeat_reframe["required"],
-            "retry_used": reframe_retry_used,
-            "fallback_used": reframe_fallback_used,
+                intent_fallback_used = True
+        lobe_execution["repeat_deliberation"] = {
+            "enabled": repeat_deliberation["enabled"],
+            "assessment": repeat_assessment,
+            "revision_used": repeat_revision_used,
+            "intent_fallback_used": intent_fallback_used,
         }
 
         executive_escalation = str(executive.get("repeat_escalation", "hold"))
@@ -848,7 +1132,7 @@ async def chat(session_id: str, req: ChatRequest) -> dict[str, Any]:
         )
         classification = classification.model_copy(update={"repeat_dynamics": repeat_dynamics})
 
-        dynamics_mutation_results = []
+        turn_proposals: list[dict[str, Any]] = []
         if topic_state_changed:
             dynamics_proposal = MutationProposal(
                 operation=MutationOperation.SET_MUTABLE_STATE,
@@ -863,13 +1147,10 @@ async def chat(session_id: str, req: ChatRequest) -> dict[str, Any]:
                     f"repeat_escalation={executive_escalation}."
                 ),
             )
-            dynamics_mutation_results = await post_json(
-                client,
-                f"{MEMORY_URL}/mutations/{character_id}",
-                {"proposals": [dynamics_proposal.model_dump(mode="json")]},
-            )
+            turn_proposals.append(dynamics_proposal.model_dump(mode="json"))
 
         character_event = EventRecord(
+            id=f"evt_{uuid.uuid4().hex}",
             character_id=character_id,
             session_id=session_id,
             event_type="character_message",
@@ -886,27 +1167,19 @@ async def chat(session_id: str, req: ChatRequest) -> dict[str, Any]:
                 "lobe_execution": lobe_execution,
             },
         )
-        character_event = EventRecord.model_validate(
-            await post_json(client, f"{MEMORY_URL}/events", character_event.model_dump(mode="json"))
-        )
-
         # Turn-level self-history is an infrastructure invariant, not a best-effort model suggestion.
         # Reflection handles higher-order consolidation later.
-        stored_memories = [
-            await post_json(
-                client,
-                f"{MEMORY_URL}/memories",
-                MemoryRecord(
-                    character_id=character_id,
-                    kind="self_history",
-                    topic=str(executive.get("topic") or topic),
-                    content=speech,
-                    epistemic_type="self_statement",
-                    confidence=1.0,
-                    salience=0.65,
-                    source_event_ids=[user_event.id or "", character_event.id or ""],
-                    metadata={"session_id": session_id},
-                ).model_dump(mode="json"),
+        pending_memories = [
+            MemoryRecord(
+                character_id=character_id,
+                kind="self_history",
+                topic=str(executive.get("topic") or topic),
+                content=speech,
+                epistemic_type="self_statement",
+                confidence=1.0,
+                salience=0.65,
+                source_event_ids=[user_event.id or "", character_event.id or ""],
+                metadata={"session_id": session_id},
             )
         ]
         memory_writes = executive.get("memory_writes", [])
@@ -929,19 +1202,22 @@ async def chat(session_id: str, req: ChatRequest) -> dict[str, Any]:
                 source_event_ids=[user_event.id or "", character_event.id or ""],
                 metadata={"session_id": session_id},
             )
-            stored_memories.append(await post_json(client, f"{MEMORY_URL}/memories", record.model_dump(mode="json")))
+            pending_memories.append(record)
 
         immediate = executive.get("mutations", [])
-        mutation_results = list(dynamics_mutation_results)
         if immediate:
-            proposals = [MutationProposal.model_validate(p).model_dump(mode="json") for p in immediate]
-            mutation_results.extend(
-                await post_json(
-                    client,
-                    f"{MEMORY_URL}/mutations/{character_id}",
-                    {"proposals": proposals},
-                )
-            )
+            turn_proposals.extend(MutationProposal.model_validate(p).model_dump(mode="json") for p in immediate)
+        committed_turn = await post_json(
+            client,
+            f"{MEMORY_URL}/sessions/{session_id}/turn",
+            {
+                "character_event": character_event.model_dump(mode="json"),
+                "memories": [memory.model_dump(mode="json") for memory in pending_memories],
+                "proposals": turn_proposals,
+            },
+        )
+        stored_memories = committed_turn["memories"]
+        mutation_results = committed_turn["mutation_results"]
 
         return {
             "session_id": session_id,
@@ -957,9 +1233,11 @@ async def chat(session_id: str, req: ChatRequest) -> dict[str, Any]:
                     "left": left_ms,
                     "right": right_ms,
                     "lobes_critical_path": max(left_ms, right_ms),
-                    "executive": executive_ms,
-                    "executive_reframe_retry": reframe_retry_ms,
-                    "model_critical_path": max(left_ms, right_ms) + executive_ms,
+                    "executive": repeat_assessment_ms + executive_ms,
+                    "executive_speech": executive_ms,
+                    "executive_repeat_assessment": repeat_assessment_ms,
+                    "executive_repeat_revision": repeat_revision_ms,
+                    "model_critical_path": max(left_ms, right_ms) + repeat_assessment_ms + executive_ms,
                 },
             },
             "memory_writes": stored_memories,
@@ -972,8 +1250,7 @@ async def _session_meta(client: httpx.AsyncClient, session_id: str) -> dict[str,
     return await get_json(client, f"{MEMORY_URL}/sessions/{session_id}")
 
 
-@app.post("/sessions/{session_id}/reflect", response_model=ReflectionResult)
-async def reflect(session_id: str) -> ReflectionResult:
+async def _reflect(session_id: str) -> ReflectionResult:
     async with httpx.AsyncClient(timeout=httpx.Timeout(WORKER_REQUEST_TIMEOUT_SECONDS, connect=10)) as client:
         session_meta = await _session_meta(client, session_id)
         character_id = session_meta["character_id"]
@@ -1087,15 +1364,43 @@ async def reflect(session_id: str) -> ReflectionResult:
         )
 
 
+@app.post("/sessions/{session_id}/reflect", response_model=ReflectionResult)
+async def reflect(session_id: str) -> ReflectionResult:
+    async with session_operation_lock(session_id):
+        try:
+            async with asyncio.timeout(TURN_TIMEOUT_SECONDS):
+                return await _reflect(session_id)
+        except TimeoutError as exc:
+            raise HTTPException(504, "Reflection exceeded the response time limit.") from exc
+
+
 @app.post("/sessions/{session_id}/close")
 async def close(session_id: str) -> dict[str, Any]:
-    reflection = await reflect(session_id)
-    async with httpx.AsyncClient(timeout=20) as client:
-        closed = await post_json(client, f"{MEMORY_URL}/sessions/{session_id}/close", {})
-    return {"session": closed, "reflection": reflection.model_dump(mode="json")}
+    """Close authoritatively; reflection enriches a conversation but never traps it open."""
+
+    async with session_operation_lock(session_id):
+        reflection: ReflectionResult | None = None
+        reflection_warning: str | None = None
+        try:
+            async with asyncio.timeout(TURN_TIMEOUT_SECONDS):
+                reflection = await _reflect(session_id)
+        except (HTTPException, TimeoutError):
+            # A local model can be temporarily unable to produce a valid optional
+            # reflection. The user's explicit close action must still release the
+            # session lock and prevent more messages from being accepted.
+            reflection_warning = "The conversation closed, but its reflection could not be generated."
+        async with httpx.AsyncClient(timeout=20) as client:
+            closed = await post_json(client, f"{MEMORY_URL}/sessions/{session_id}/close", {})
+        return {
+            "session": closed,
+            "reflection": reflection.model_dump(mode="json") if reflection else None,
+            "reflection_warning": reflection_warning,
+        }
 
 
 @app.get("/debug/{character_id}")
 async def debug(character_id: str) -> Any:
+    if not DEBUG_API_ENABLED:
+        raise HTTPException(404, "Debug routes are disabled.")
     async with httpx.AsyncClient(timeout=20) as client:
         return await get_json(client, f"{MEMORY_URL}/debug/{character_id}")

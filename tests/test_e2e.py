@@ -88,58 +88,66 @@ def test_character_continuity_and_reflection(tmp_path: Path):
                 "LEFT_URL": f"http://127.0.0.1:{ports['left']}",
                 "RIGHT_URL": f"http://127.0.0.1:{ports['right']}",
                 "EXEC_URL": f"http://127.0.0.1:{ports['exec']}",
+                "API_AUTH_TOKEN": "integration-test-token",
+                "ENABLE_DEBUG_API": "true",
             },
         )
         wait_for(f"http://127.0.0.1:{ports['orch']}/health")
 
         base = f"http://127.0.0.1:{ports['orch']}"
-        session = httpx.post(f"{base}/sessions", json={"character_id": "elena_voss"}).json()
+        headers = {"X-API-Key": "integration-test-token"}
+        session = httpx.post(f"{base}/sessions", json={"character_id": "elena_voss"}, headers=headers).json()
         sid = session["id"]
 
-        first = httpx.post(f"{base}/sessions/{sid}/chat", json={"message": "Where were you born?"}, timeout=10).json()
+        first = httpx.post(f"{base}/sessions/{sid}/chat", json={"message": "Where were you born?"}, headers=headers, timeout=10).json()
         assert first["message"] == "Northbridge"
         assert first["interaction"]["interaction_type"] == "new_subject"
 
-        second = httpx.post(f"{base}/sessions/{sid}/chat", json={"message": "What's your hometown again?"}, timeout=10).json()
+        repeat_payload = {"message": "What's your hometown again?", "idempotency_key": "repeat-question-key"}
+        second = httpx.post(f"{base}/sessions/{sid}/chat", json=repeat_payload, headers=headers, timeout=10).json()
         assert "Northbridge" in second["message"]
         assert "asked me that before" in second["message"]
         assert second["interaction"]["interaction_type"] == "repeated_question"
         assert second["interaction"]["times_asked"] == 2
+        replay = httpx.post(f"{base}/sessions/{sid}/chat", json=repeat_payload, headers=headers, timeout=10).json()
+        assert replay["idempotent_replay"] is True
+        assert replay["message"] == second["message"]
 
-        closed = httpx.post(f"{base}/sessions/{sid}/close", json={}, timeout=10).json()
+        closed = httpx.post(f"{base}/sessions/{sid}/close", json={}, headers=headers, timeout=10).json()
         assert closed["session"]["status"] == "closed"
         assert "Interaction contained" in closed["reflection"]["summary"]
         assert closed["reflection"]["mutation_results"][0]["status"] == "allowed"
 
-        debug = httpx.get(f"{base}/debug/elena_voss", timeout=10).json()
+        debug = httpx.get(f"{base}/debug/elena_voss", headers=headers, timeout=10).json()
         assert any(e["event_type"] == "reflection" for e in debug["events"])
         assert any(m["kind"] == "self_history" for m in debug["memories"])
         assert any(m["status"] == "allowed" for m in debug["mutations"])
 
-        # A new interaction on the same topic remains aware of the earlier interaction.
-        session2 = httpx.post(f"{base}/sessions", json={"character_id": "elena_voss"}).json()
+        # A new interaction has access to earlier history during reflection, but
+        # repeat pressure and patience are scoped to this new conversation.
+        session2 = httpx.post(f"{base}/sessions", json={"character_id": "elena_voss"}, headers=headers).json()
         sid2 = session2["id"]
-        third = httpx.post(f"{base}/sessions/{sid2}/chat", json={"message": "Where are you from?"}, timeout=10).json()
-        assert third["interaction"]["interaction_type"] == "repeated_question"
-        reflected = httpx.post(f"{base}/sessions/{sid2}/reflect", json={}, timeout=10).json()
+        third = httpx.post(f"{base}/sessions/{sid2}/chat", json={"message": "Where are you from?"}, headers=headers, timeout=10).json()
+        assert third["interaction"]["interaction_type"] == "new_subject"
+        reflected = httpx.post(f"{base}/sessions/{sid2}/reflect", json={}, headers=headers, timeout=10).json()
         assert any(
             m["proposal"]["operation"] == "link_events" and m["status"] == "allowed"
             for m in reflected["mutation_results"]
         )
 
-        debug_after_reflect = httpx.get(f"{base}/debug/elena_voss", timeout=10).json()
+        debug_after_reflect = httpx.get(f"{base}/debug/elena_voss", headers=headers, timeout=10).json()
         mutation_count = len(debug_after_reflect["mutations"])
         link_count = len(debug_after_reflect["links"])
         assert link_count >= 1
 
         # Reflection is idempotent until a new conversational event is appended.
-        reflected_again = httpx.post(f"{base}/sessions/{sid2}/reflect", json={}, timeout=10).json()
-        debug_after_repeat = httpx.get(f"{base}/debug/elena_voss", timeout=10).json()
+        reflected_again = httpx.post(f"{base}/sessions/{sid2}/reflect", json={}, headers=headers, timeout=10).json()
+        debug_after_repeat = httpx.get(f"{base}/debug/elena_voss", headers=headers, timeout=10).json()
         assert len(debug_after_repeat["mutations"]) == mutation_count
         assert reflected_again["summary"] == reflected["summary"]
 
-        httpx.post(f"{base}/sessions/{sid2}/close", json={}, timeout=10).raise_for_status()
-        rejected = httpx.post(f"{base}/sessions/{sid2}/chat", json={"message": "Still there?"}, timeout=10)
+        httpx.post(f"{base}/sessions/{sid2}/close", json={}, headers=headers, timeout=10).raise_for_status()
+        rejected = httpx.post(f"{base}/sessions/{sid2}/chat", json={"message": "Still there?"}, headers=headers, timeout=10)
         assert rejected.status_code == 409
     finally:
         for p in reversed(processes):

@@ -9,7 +9,7 @@ from fastapi import HTTPException
 os.environ.setdefault("COGNITIVE_ROLE", "left")
 
 from services.cognitive_worker import app as worker  # noqa: E402
-from services.common import CognitiveRequest, LeftAnalysis, RightAnalysis  # noqa: E402
+from services.common import CognitiveRequest, ExecutiveRepeatAssessment, LeftAnalysis, RightAnalysis  # noqa: E402
 
 
 def test_worker_retries_an_incomplete_json_completion(monkeypatch: pytest.MonkeyPatch):
@@ -89,3 +89,20 @@ def test_worker_recovers_allowlisted_fields_from_interrupted_lobe_json(monkeypat
     assert result.topic == "topic.missing_cargo"
     assert result.fact_refs == ["missing cargo", "lost shipment"]
     assert result.action == "answer"
+
+
+def test_worker_recovers_a_repeat_assessment_from_a_near_miss(monkeypatch: pytest.MonkeyPatch):
+    async def near_miss_completion(*_args, **_kwargs) -> str:
+        return (
+            '{"hypothesis":"wants_more_detail","alternatives":["checking_consistency"],'
+            '"recommended_action":"different_angle","speech":"must not be retained"}'
+        )
+
+    monkeypatch.setattr(worker, "_request_completion", near_miss_completion)
+    request = CognitiveRequest.model_construct(mode="repeat_assessment")
+
+    result = asyncio.run(worker._request_model(request, ExecutiveRepeatAssessment))
+
+    assert result.primary_hypothesis == "wants_more_detail"
+    assert result.response_mode == "new_angle"
+    assert result.alternative_hypotheses == ["checking_consistency"]
