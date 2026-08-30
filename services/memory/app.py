@@ -482,12 +482,26 @@ def interaction_history(
             """,
             (character_id, topic, limit),
         ).fetchall()
-    events = [dict(r) for r in reversed(rows)]
-    user_questions = [r for r in events if r["event_type"] == "user_message"]
+    raw_events = [dict(r) for r in reversed(rows)]
+    events = [{**row, "metadata": json.loads(row["metadata_json"])} for row in raw_events]
+    answered_user_ids = {
+        str(event["metadata"].get("responds_to"))
+        for event in events
+        if event["event_type"] == "character_message" and event["metadata"].get("responds_to")
+    }
+    # An upstream model failure can leave a user event without a character
+    # response. It remains available in the raw session audit trail, but must not
+    # count as an answered question or make a retry look adversarial.
+    completed_events = [
+        event
+        for event in events
+        if event["event_type"] == "character_message" or event["id"] in answered_user_ids
+    ]
+    user_questions = [event for event in completed_events if event["event_type"] == "user_message"]
     prior_answer = None
-    for r in reversed(events):
-        if r["event_type"] == "character_message":
-            prior_answer = r["content"]
+    for event in reversed(completed_events):
+        if event["event_type"] == "character_message":
+            prior_answer = event["content"]
             break
     return {
         "topic": topic,
@@ -500,10 +514,10 @@ def interaction_history(
                 "actor": r["actor"],
                 "content": r["content"],
                 "topic": r["topic"],
-                "metadata": json.loads(r["metadata_json"]),
+                "metadata": r["metadata"],
                 "created_at": r["created_at"],
             }
-            for r in events
+            for r in completed_events
         ],
     }
 

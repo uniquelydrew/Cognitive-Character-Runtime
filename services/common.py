@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class EpistemicType(StrEnum):
@@ -88,12 +88,14 @@ class CharacterDocument(BaseModel):
 
 
 class RepeatDynamics(BaseModel):
-    """Deterministic conversational pressure supplied to the executive role."""
+    """Measured repeat pressure and a non-binding escalation recommendation."""
 
     conversation_patience: float = Field(default=1.0, ge=0.0, le=1.0)
     subject_defensiveness: float = Field(default=0.0, ge=0.0, le=1.0)
     intersection_pressure: float = Field(default=0.0, ge=0.0, le=1.0)
     response_posture: Literal["normal", "reclarify", "confused", "defensive"] = "normal"
+    suggested_posture: Literal["normal", "reclarify", "confused", "defensive"] = "normal"
+    escalation_recommendation: Literal["hold", "increase", "deescalate"] = "hold"
     semantic_repeat: bool = False
     consecutive_repeats: int = Field(default=1, ge=1)
     subject_key: str | None = None
@@ -141,19 +143,42 @@ class ModelOutput(BaseModel):
     model_config = {"extra": "forbid"}
 
 
+CompactAtom = Annotated[str, Field(min_length=1, max_length=96)]
+# Small local models occasionally expand a requested code into a short phrase.
+# Preserve the bounded control-artifact contract without turning that recoverable
+# phrasing variation into a failed user turn.
+CompactCode = Annotated[str, Field(min_length=1, max_length=96)]
+
+
 class LeftAnalysis(ModelOutput):
-    topic: str = Field(min_length=1, max_length=160)
-    observations: list[str] = Field(default_factory=list, max_length=12)
-    consistency_constraints: list[str] = Field(default_factory=list, max_length=12)
-    recommended_strategy: str = Field(min_length=1, max_length=500)
+    """A compact analytic control artifact, not prose for the user."""
+
+    # The orchestrator already has a deterministic topic for every turn. A small
+    # local model may omit this redundant field after otherwise completing JSON.
+    topic: CompactAtom = "topic.general"
+    fact_refs: list[CompactAtom] = Field(default_factory=list, max_length=4)
+    constraints: list[CompactCode] = Field(default_factory=list, max_length=3)
+    action: CompactCode
     confidence: float = Field(ge=0.0, le=1.0)
 
 
 class RightAnalysis(ModelOutput):
-    social_read: str = Field(min_length=1, max_length=500)
-    affect: dict[str, float] = Field(default_factory=dict)
-    recommended_tone: str = Field(min_length=1, max_length=160)
-    associations: list[str] = Field(default_factory=list, max_length=12)
+    """A compact relational control artifact, not prose for the user."""
+
+    action: CompactCode
+    affect: dict[CompactCode, float] = Field(default_factory=dict, max_length=4)
+    tone: CompactCode
+    risk: CompactCode
+    association_keys: list[CompactAtom] = Field(default_factory=list, max_length=4)
+
+    @field_validator("action", mode="before")
+    @classmethod
+    def coerce_single_action(cls, value: Any) -> Any:
+        """Accept a local model's one-item action list as its scalar control key."""
+
+        if isinstance(value, list) and len(value) == 1 and isinstance(value[0], str):
+            return value[0]
+        return value
 
 
 class MemoryWrite(ModelOutput):
@@ -170,6 +195,9 @@ class ExecutiveTurn(ModelOutput):
     strategy: str = Field(min_length=1, max_length=500)
     speech: str = Field(min_length=1, max_length=8_000)
     topic: str = Field(min_length=1, max_length=160)
+    # Repeat pressure is evidence, not an automatic emotional reaction. The
+    # executive decides whether this turn should alter durable defensiveness.
+    repeat_escalation: Literal["hold", "increase", "deescalate"] = "hold"
     mutations: list[MutationProposal] = Field(default_factory=list, max_length=20)
     memory_writes: list[MemoryWrite] = Field(default_factory=list, max_length=10)
 

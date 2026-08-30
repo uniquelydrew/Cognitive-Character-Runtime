@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import time
 from typing import Any
 
 import httpx
@@ -103,6 +104,63 @@ def _token_similarity(left: str, right: str) -> float:
     return len(left_tokens & right_tokens) / len(left_tokens | right_tokens)
 
 
+def _response_terms(text: str) -> set[str]:
+    """Normalize a few common inflections before checking a repeated answer.
+
+    This is deliberately not a semantic similarity system.  It is a narrow guard
+    for the exact-repeat fast path, where the executive has already been told
+    which previous answer it must reframe.  A small amount of stemming catches
+    outputs such as ``protect`` / ``protecting`` without making a new answer on
+    the same subject look automatically invalid.
+    """
+
+    terms: set[str] = set()
+    for token in _content_tokens(text):
+        if len(token) > 5 and token.endswith("ing"):
+            token = token[:-3]
+        elif len(token) > 4 and token.endswith("ied"):
+            token = token[:-3] + "y"
+        elif len(token) > 4 and token.endswith("ed"):
+            token = token[:-2]
+        elif len(token) > 4 and token.endswith("ies"):
+            token = token[:-3] + "y"
+        elif len(token) > 4 and token.endswith("es"):
+            token = token[:-2]
+        elif len(token) > 3 and token.endswith("s"):
+            token = token[:-1]
+        if len(token) > 1:
+            terms.add(token)
+    return terms
+
+
+def response_substantially_repeats_prior_answer(speech: str, prior_speech: str) -> bool:
+    """Return whether the Executive merely echoed the immediate prior answer.
+
+    The check is only applied after exact-question lobe reuse.  It permits the
+    Executive to stay on the same topic, while blocking answers whose fact-bearing
+    wording is substantially the same as the answer the user has already seen.
+    """
+
+    if _question_signature(speech) == _question_signature(prior_speech):
+        return True
+    speech_terms = _response_terms(speech)
+    prior_terms = _response_terms(prior_speech)
+    if len(speech_terms) < 3 or len(prior_terms) < 3:
+        return False
+    shared = len(speech_terms & prior_terms)
+    return shared >= 3 and (shared / min(len(speech_terms), len(prior_terms))) >= 0.60
+
+
+def repeat_reframe_fallback(posture: str) -> str:
+    """Safe last resort if the executive ignores two explicit reframe requests."""
+
+    if posture == "defensive":
+        return "I've answered that. What specific part are you trying to clarify?"
+    if posture == "confused":
+        return "I may be missing what you need from that question. Which part should I clarify?"
+    return "I want to make sure I address what you need. Which part would you like me to clarify?"
+
+
 def _clamp(value: float) -> float:
     return max(0.0, min(1.0, value))
 
@@ -115,16 +173,87 @@ def _model_topic(value: Any) -> str | None:
 
 
 def _analysis_anchor_tokens(analysis: dict[str, Any]) -> set[str]:
-    """Extract fact-bearing terms from a lobe result without generic reasoning words."""
+    """Extract fact-bearing terms from compact or legacy lobe artifacts."""
 
-    values = [str(analysis.get("topic", "")), str(analysis.get("recommended_strategy", ""))]
-    values.extend(str(item) for item in analysis.get("observations", []) if isinstance(item, str))
-    values.extend(str(item) for item in analysis.get("associations", []) if isinstance(item, str))
+    values = [
+        str(analysis.get("topic", "")),
+        str(analysis.get("action", "")),
+        # Legacy keys keep stored historical turns useful after the contract change.
+        str(analysis.get("recommended_strategy", "")),
+    ]
+    for key in ("fact_refs", "association_keys", "observations", "associations"):
+        values.extend(str(item) for item in analysis.get(key, []) if isinstance(item, str))
     return {
         token
         for value in values
         for token in _content_tokens(value)
         if token not in ANALYSIS_STOP_WORDS
+    }
+
+
+def _analysis_keys(analysis: dict[str, Any], *field_names: str) -> set[str]:
+    """Return compact keys exactly, avoiding lexical loss for dotted fact IDs."""
+
+    keys: set[str] = set()
+    for field_name in field_names:
+        value = analysis.get(field_name, [])
+        if isinstance(value, str):
+            value = [value]
+        if isinstance(value, list):
+            keys.update(str(item).strip().lower() for item in value if isinstance(item, str) and item.strip())
+    return keys
+
+
+def _question_signature(message: str) -> str:
+    """Canonicalize only exact repeats; rephrases still receive fresh lobe work."""
+
+    return " ".join(CONTENT_TOKEN_RE.findall(message.lower()))
+
+
+def immediate_repeat_lobe_reuse(
+    *,
+    message: str,
+    topic: str,
+    session_events: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Reuse lobe artifacts for the immediately preceding answered same question.
+
+    The fast path intentionally requires an exact normalized question in the same
+    session. Rephrased questions continue through Left and Right so the executive
+    can use their semantic evidence to recognize a non-exact repeat.
+    """
+
+    conversation = [
+        event
+        for event in session_events
+        if event.get("event_type") in {"user_message", "character_message"}
+    ]
+    if not conversation or conversation[-1].get("event_type") != "character_message":
+        return None
+    reply = conversation[-1]
+    reply_metadata = reply.get("metadata", {})
+    if not isinstance(reply_metadata, dict):
+        return None
+    prior_user_id = str(reply_metadata.get("responds_to") or "")
+    prior_user = next(
+        (event for event in reversed(conversation[:-1]) if str(event.get("id")) == prior_user_id),
+        None,
+    )
+    if not prior_user or str(prior_user.get("topic") or "") != topic:
+        return None
+    if _question_signature(str(prior_user.get("content", ""))) != _question_signature(message):
+        return None
+    left = reply_metadata.get("left")
+    right = reply_metadata.get("right")
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        return None
+    return {
+        "left": left,
+        "right": right,
+        "prior_speech": str(reply.get("content") or "").strip(),
+        "source_event_id": reply.get("id"),
+        "source_user_event_id": prior_user.get("id"),
+        "reason": "immediate_answered_exact_repeat",
     }
 
 
@@ -147,14 +276,24 @@ def executive_repeat_review(
     """
 
     prior_events = [event for event in session_events if event.get("id") != current_event_id]
-    prior_users = [event for event in prior_events if event.get("event_type") == "user_message"]
     replies_by_user = {
         str(event.get("metadata", {}).get("responds_to")): event
         for event in prior_events
         if event.get("event_type") == "character_message" and event.get("metadata", {}).get("responds_to")
     }
+    # Failed worker calls can leave a user event without a reply. Keep it in the
+    # transcript for auditability, but a retried request must not be treated as
+    # repeated pressure until the character has actually answered it once.
+    prior_users = [
+        event
+        for event in prior_events
+        if event.get("event_type") == "user_message" and str(event.get("id")) in replies_by_user
+    ]
     current_left_topic = _model_topic(left_result.get("topic"))
-    current_associations = " ".join(str(item) for item in right_result.get("associations", []))
+    current_associations = " ".join(
+        _analysis_keys(right_result, "association_keys", "associations")
+    )
+    current_fact_refs = _analysis_keys(left_result, "fact_refs")
 
     best: dict[str, Any] | None = None
     for user_event in prior_users:
@@ -179,14 +318,22 @@ def executive_repeat_review(
 
         if prior_reply:
             current_anchors = _analysis_anchor_tokens(left_result)
-            prior_anchors = _analysis_anchor_tokens(prior_reply.get("metadata", {}).get("left", {}))
+            prior_left = prior_reply.get("metadata", {}).get("left", {})
+            prior_anchors = _analysis_anchor_tokens(prior_left)
             shared_anchors = current_anchors & prior_anchors
             if len(shared_anchors) >= 2 and score < 0.76:
                 score, reason = 0.76, "left analyses share subject-specific fact anchors"
+            shared_fact_refs = current_fact_refs & _analysis_keys(prior_left, "fact_refs")
+            if shared_fact_refs and score < 0.78:
+                score, reason = 0.78, "left analyses reference the same established fact"
 
         if current_associations and prior_reply:
             prior_associations = " ".join(
-                str(item) for item in prior_reply.get("metadata", {}).get("right", {}).get("associations", [])
+                _analysis_keys(
+                    prior_reply.get("metadata", {}).get("right", {}),
+                    "association_keys",
+                    "associations",
+                )
             )
             association_score = _token_similarity(current_associations, prior_associations)
             if association_score >= 0.5 and score < 0.66:
@@ -256,8 +403,9 @@ def derive_repeat_dynamics(
     mutable_state: dict[str, Any],
     review: dict[str, Any],
     user_turn_count: int,
+    escalation_decision: str = "hold",
 ) -> tuple[RepeatDynamics, dict[str, float], bool]:
-    """Intersect conversation patience with durable, subject-specific defensiveness."""
+    """Measure repeat pressure; only the executive may raise durable defensiveness."""
 
     raw_topics = mutable_state.get("topic_defensiveness", {})
     if not isinstance(raw_topics, dict):
@@ -274,13 +422,24 @@ def derive_repeat_dynamics(
 
     if semantic_repeat:
         added_pressure = 0.24 + (0.04 * min(max(consecutive_repeats - 2, 0), 3))
-        subject_defensiveness = _clamp((prior_defensiveness * 0.96) + added_pressure)
+        projected_defensiveness = _clamp((prior_defensiveness * 0.96) + added_pressure)
     elif prior_defensiveness:
         # Returning to a charged subject can cool it slowly, but never erase it merely
         # because the user changed wording or briefly moved to another subject.
-        subject_defensiveness = _clamp(prior_defensiveness * 0.97)
+        projected_defensiveness = _clamp(prior_defensiveness * 0.97)
     else:
-        subject_defensiveness = 0.0
+        projected_defensiveness = 0.0
+
+    if semantic_repeat and escalation_decision == "increase":
+        subject_defensiveness = projected_defensiveness
+    elif escalation_decision == "deescalate":
+        subject_defensiveness = _clamp(prior_defensiveness * 0.70)
+    elif semantic_repeat:
+        # A repeat alone is evidence, not a license to make the character more
+        # suspicious. The executive's default hold preserves the current gauge.
+        subject_defensiveness = prior_defensiveness
+    else:
+        subject_defensiveness = projected_defensiveness
 
     updated_topics = dict(topic_defensiveness)
     changed = abs(subject_defensiveness - prior_defensiveness) >= 0.001
@@ -294,15 +453,18 @@ def derive_repeat_dynamics(
     repetition_drain = 0.115 * max(consecutive_repeats - 1, 0)
     conversation_patience = _clamp(baseline_patience - conversation_drain - repetition_drain)
     intersection_pressure = _clamp(subject_defensiveness * (1.0 - conversation_patience))
+    suggested_pressure = _clamp(projected_defensiveness * (1.0 - conversation_patience))
 
-    if intersection_pressure >= 0.36:
-        posture = "defensive"
-    elif intersection_pressure >= 0.16:
-        posture = "confused"
-    elif semantic_repeat:
-        posture = "reclarify"
-    else:
-        posture = "normal"
+    def posture_for(pressure: float) -> str:
+        if pressure >= 0.36:
+            return "defensive"
+        if pressure >= 0.16:
+            return "confused"
+        return "reclarify" if semantic_repeat else "normal"
+
+    posture = posture_for(intersection_pressure)
+    suggested_posture = posture_for(suggested_pressure)
+    escalation_recommendation = "increase" if semantic_repeat and consecutive_repeats >= 2 else "hold"
 
     return (
         RepeatDynamics(
@@ -310,6 +472,8 @@ def derive_repeat_dynamics(
             subject_defensiveness=round(subject_defensiveness, 4),
             intersection_pressure=round(intersection_pressure, 4),
             response_posture=posture,
+            suggested_posture=suggested_posture,
+            escalation_recommendation=escalation_recommendation,
             semantic_repeat=semantic_repeat,
             consecutive_repeats=consecutive_repeats,
             subject_key=subject_key,
@@ -318,21 +482,6 @@ def derive_repeat_dynamics(
         updated_topics,
         changed,
     )
-
-
-def apply_repeat_posture(speech: str, dynamics: RepeatDynamics) -> str:
-    """Make the executive's deterministic posture visible when a small model ignores it.
-
-    The executive still authors the factual reply. This narrow delivery guard only
-    adds the already-derived relational boundary, so a valid repeat signal cannot
-    silently turn into another identical, endlessly patient response.
-    """
-
-    if dynamics.response_posture == "confused":
-        return f"{speech.rstrip()} I'm a little confused—we've just covered that."
-    if dynamics.response_posture == "defensive":
-        return f"{speech.rstrip()} I've already answered that. Please don't keep pressing the same question."
-    return speech
 
 
 async def get_json(client: httpx.AsyncClient, url: str) -> Any:
@@ -405,6 +554,19 @@ async def infer(
     if response.role != expected_role:
         raise HTTPException(502, f"Expected {expected_role} worker response, received {response.role!r}")
     return response.result
+
+
+async def infer_timed(
+    client: httpx.AsyncClient,
+    base_url: str,
+    req: CognitiveRequest,
+    expected_role: str,
+) -> tuple[dict[str, Any], int]:
+    """Return a worker result with monotonic timing for live topology comparisons."""
+
+    started = time.perf_counter()
+    result = await infer(client, base_url, req, expected_role)
+    return result, round((time.perf_counter() - started) * 1000)
 
 
 @app.get("/health")
@@ -501,6 +663,12 @@ async def chat(session_id: str, req: ChatRequest) -> dict[str, Any]:
             times_asked=prior_times + 1,
             related_event_ids=[e["id"] for e in history.get("events", [])],
         )
+        prior_transcript = await get_json(client, f"{MEMORY_URL}/sessions/{session_id}/events")
+        lobe_reuse = immediate_repeat_lobe_reuse(
+            message=req.message,
+            topic=topic,
+            session_events=prior_transcript,
+        )
 
         user_event = EventRecord(
             character_id=character_id,
@@ -525,9 +693,21 @@ async def chat(session_id: str, req: ChatRequest) -> dict[str, Any]:
         }
         cognition_req = CognitiveRequest(character=character, user_input=req.message, context=common_context)
 
-        left_task = infer(client, LEFT_URL, cognition_req, "left")
-        right_task = infer(client, RIGHT_URL, cognition_req, "right")
-        left_result, right_result = await asyncio.gather(left_task, right_task)
+        if lobe_reuse:
+            left_result = dict(lobe_reuse["left"])
+            right_result = dict(lobe_reuse["right"])
+            left_ms = right_ms = 0
+            lobe_execution = {
+                "mode": "reused",
+                "source_event_id": lobe_reuse["source_event_id"],
+                "source_user_event_id": lobe_reuse["source_user_event_id"],
+                "reason": lobe_reuse["reason"],
+            }
+        else:
+            left_task = infer_timed(client, LEFT_URL, cognition_req, "left")
+            right_task = infer_timed(client, RIGHT_URL, cognition_req, "right")
+            (left_result, left_ms), (right_result, right_ms) = await asyncio.gather(left_task, right_task)
+            lobe_execution = {"mode": "fresh"}
 
         # The lobes are intentionally free to arrive at overlapping thoughts. The
         # executive receives a separate, bounded review after both are complete so
@@ -544,11 +724,12 @@ async def chat(session_id: str, req: ChatRequest) -> dict[str, Any]:
             prior_times=prior_times,
         )
         user_turn_count = sum(1 for event in transcript if event.get("event_type") == "user_message")
-        repeat_dynamics, updated_topic_defensiveness, topic_state_changed = derive_repeat_dynamics(
+        repeat_dynamics, _, _ = derive_repeat_dynamics(
             character=character,
             mutable_state=state.get("mutable_state", {}),
             review=repeat_review,
             user_turn_count=user_turn_count,
+            escalation_decision="hold",
         )
 
         related_event_ids = list(classification.related_event_ids)
@@ -575,6 +756,98 @@ async def chat(session_id: str, req: ChatRequest) -> dict[str, Any]:
             }
         )
 
+        prior_repeated_speech = str(
+            lobe_reuse.get("prior_speech") if lobe_reuse else repeat_review.get("matched_answer") or ""
+        ).strip()
+        repeat_reframe = {
+            "required": bool(lobe_reuse and prior_repeated_speech),
+            # A bounded copy lets the Executive compare its answer without adding
+            # unbounded transcript history to the repeat fast path.
+            "previous_speech": prior_repeated_speech[:1600],
+            "allowed_moves": [
+                "answer from a different established facet",
+                "acknowledge and clarify the user's intended detail",
+                "set a concise, proportionate boundary",
+            ],
+        }
+        if repeat_reframe["required"]:
+            lobe_execution["repeat_reframe_required"] = True
+
+        executive_mutable_state = dict(state.get("mutable_state", {}))
+        executive_mutable_state["topic_defensiveness"] = state.get("mutable_state", {}).get(
+            "topic_defensiveness", {}
+        )
+        executive_context = {
+            **common_context,
+            "interaction": classification.model_dump(mode="json"),
+            "conversation_dynamics": repeat_dynamics.model_dump(mode="json"),
+            "executive_repeat_review": repeat_review,
+            "lobe_execution": lobe_execution,
+            "repeat_reframe": repeat_reframe,
+            "mutable_state": executive_mutable_state,
+        }
+        exec_req = cognition_req.model_copy(
+            update={
+                "context": executive_context,
+                "left_result": left_result,
+                "right_result": right_result,
+            }
+        )
+        executive, executive_ms = await infer_timed(client, EXEC_URL, exec_req, "executive")
+        speech = str(executive.get("speech", "")).strip()
+        if not speech:
+            raise HTTPException(502, "Executive produced no speech")
+        executive = {**executive, "speech": speech}
+
+        reframe_retry_ms = 0
+        reframe_retry_used = False
+        reframe_fallback_used = False
+        if repeat_reframe["required"] and response_substantially_repeats_prior_answer(
+            speech, prior_repeated_speech
+        ):
+            # Preserve the saved lobe work, but give the Executive one focused
+            # chance to correct an answer that merely echoes what the user saw.
+            reframe_retry_used = True
+            retry_reframe = {
+                **repeat_reframe,
+                "previous_attempt": speech[:1600],
+                "retry_reason": (
+                    "The previous attempt substantially repeated previous_speech. "
+                    "Return a distinct reframe, a focused clarification question, "
+                    "or a proportionate boundary."
+                ),
+            }
+            retry_context = {**executive_context, "repeat_reframe": retry_reframe}
+            retry_req = exec_req.model_copy(update={"context": retry_context})
+            executive, reframe_retry_ms = await infer_timed(client, EXEC_URL, retry_req, "executive")
+            executive_ms += reframe_retry_ms
+            speech = str(executive.get("speech", "")).strip()
+            if not speech:
+                raise HTTPException(502, "Executive produced no speech on repeat reframe retry")
+            executive = {**executive, "speech": speech}
+            if response_substantially_repeats_prior_answer(speech, prior_repeated_speech):
+                # This is a deliberately neutral safety net, not an emotional
+                # escalation. The Executive's selected escalation still controls
+                # the durable defensiveness gauge below.
+                speech = repeat_reframe_fallback(repeat_dynamics.response_posture)
+                executive = {**executive, "speech": speech}
+                reframe_fallback_used = True
+        lobe_execution["repeat_reframe"] = {
+            "required": repeat_reframe["required"],
+            "retry_used": reframe_retry_used,
+            "fallback_used": reframe_fallback_used,
+        }
+
+        executive_escalation = str(executive.get("repeat_escalation", "hold"))
+        repeat_dynamics, updated_topic_defensiveness, topic_state_changed = derive_repeat_dynamics(
+            character=character,
+            mutable_state=state.get("mutable_state", {}),
+            review=repeat_review,
+            user_turn_count=user_turn_count,
+            escalation_decision=executive_escalation,
+        )
+        classification = classification.model_copy(update={"repeat_dynamics": repeat_dynamics})
+
         dynamics_mutation_results = []
         if topic_state_changed:
             dynamics_proposal = MutationProposal(
@@ -586,8 +859,8 @@ async def chat(session_id: str, req: ChatRequest) -> dict[str, Any]:
                 confidence=1.0,
                 epistemic_type=EpistemicType.SUSPICION,
                 reason=(
-                    "Persist the deterministic, subject-specific defensiveness signal "
-                    "derived from this user turn and repeat review."
+                    "Persist subject-specific defensiveness after the executive selected "
+                    f"repeat_escalation={executive_escalation}."
                 ),
             )
             dynamics_mutation_results = await post_json(
@@ -595,29 +868,6 @@ async def chat(session_id: str, req: ChatRequest) -> dict[str, Any]:
                 f"{MEMORY_URL}/mutations/{character_id}",
                 {"proposals": [dynamics_proposal.model_dump(mode="json")]},
             )
-
-        executive_mutable_state = dict(state.get("mutable_state", {}))
-        executive_mutable_state["topic_defensiveness"] = updated_topic_defensiveness
-        executive_context = {
-            **common_context,
-            "interaction": classification.model_dump(mode="json"),
-            "conversation_dynamics": repeat_dynamics.model_dump(mode="json"),
-            "executive_repeat_review": repeat_review,
-            "mutable_state": executive_mutable_state,
-        }
-        exec_req = cognition_req.model_copy(
-            update={
-                "context": executive_context,
-                "left_result": left_result,
-                "right_result": right_result,
-            }
-        )
-        executive = await infer(client, EXEC_URL, exec_req, "executive")
-        speech = str(executive.get("speech", "")).strip()
-        if not speech:
-            raise HTTPException(502, "Executive produced no speech")
-        speech = apply_repeat_posture(speech, repeat_dynamics)
-        executive = {**executive, "speech": speech}
 
         character_event = EventRecord(
             character_id=character_id,
@@ -633,6 +883,7 @@ async def chat(session_id: str, req: ChatRequest) -> dict[str, Any]:
                 "responds_to": user_event.id,
                 "interaction": classification.model_dump(mode="json"),
                 "repeat_review": repeat_review,
+                "lobe_execution": lobe_execution,
             },
         )
         character_event = EventRecord.model_validate(
@@ -697,7 +948,20 @@ async def chat(session_id: str, req: ChatRequest) -> dict[str, Any]:
             "character_id": character_id,
             "message": speech,
             "interaction": classification.model_dump(mode="json"),
-            "cognition": {"left": left_result, "right": right_result, "executive": executive},
+            "cognition": {
+                "left": left_result,
+                "right": right_result,
+                "executive": executive,
+                "lobe_execution": lobe_execution,
+                "timing_ms": {
+                    "left": left_ms,
+                    "right": right_ms,
+                    "lobes_critical_path": max(left_ms, right_ms),
+                    "executive": executive_ms,
+                    "executive_reframe_retry": reframe_retry_ms,
+                    "model_critical_path": max(left_ms, right_ms) + executive_ms,
+                },
+            },
             "memory_writes": stored_memories,
             "mutation_results": mutation_results,
         }

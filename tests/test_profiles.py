@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 from fastapi import HTTPException
 
-from services.common import CharacterDocument
+from services.common import CharacterDocument, EventRecord
 from services.memory import app as memory
 
 
@@ -69,3 +69,39 @@ def test_profile_id_is_stable_and_safe(isolated_profiles: Path):
         memory.update_profile("profile_test", renamed)
     with pytest.raises(HTTPException, match="Character IDs"):
         memory.profile_path("../unsafe")
+
+
+def test_interaction_history_ignores_unanswered_user_turns(isolated_profiles: Path):
+    memory.create_profile(profile())
+    unanswered = memory.add_event(EventRecord(
+        character_id="profile_test",
+        session_id=None,
+        event_type="user_message",
+        actor="user",
+        content="Where were you born?",
+        topic="self.birthplace",
+    ))
+    answered = memory.add_event(EventRecord(
+        character_id="profile_test",
+        session_id=None,
+        event_type="user_message",
+        actor="user",
+        content="What is your name?",
+        topic="self.birthplace",
+    ))
+    reply = memory.add_event(EventRecord(
+        character_id="profile_test",
+        session_id=None,
+        event_type="character_message",
+        actor="character",
+        content="Profile Test.",
+        topic="self.birthplace",
+        metadata={"responds_to": answered.id},
+    ))
+
+    history = memory.interaction_history("profile_test", "self.birthplace", limit=20)
+
+    assert history["times_asked"] == 1
+    assert history["prior_answer"] == "Profile Test."
+    assert [event["id"] for event in history["events"]] == [answered.id, reply.id]
+    assert unanswered.id not in {event["id"] for event in history["events"]}

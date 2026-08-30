@@ -428,16 +428,32 @@ The runtime maintains two separate signals:
   subject. It rises only for that subject, cools slowly on a non-repeat return, and
   is revision-audited with the user event as evidence.
 
-Their intersection selects `normal`, `reclarify`, `confused`, or `defensive` posture.
-The executive receives that posture after both lobe analyses; a small delivery guard
-makes confused and defensive boundaries visible if a lightweight local model ignores
-the requested tone.
+Their intersection produces a suggested `normal`, `reclarify`, `confused`, or
+`defensive` posture. It is evidence for the Executive, not an automatic emotional
+escalation: the Executive explicitly selects `hold`, `increase`, or `deescalate`
+before durable subject defensiveness changes.
+
+For an immediate exact repeat in the same session that already received a character
+answer, the runtime reuses the stored compact Left/Right artifacts and invokes only
+the Executive to reframe the answer. The Executive receives the prior speech and
+must choose a distinct established facet, a focused clarification question, or a
+proportionate boundary. A close echo receives one Executive-only correction attempt;
+if that still echoes, a neutral clarification fallback prevents the user from seeing
+the same answer again. Rephrases still use fresh lobe analysis so the Executive can
+detect non-exact semantic repetition safely. `cognition.timing_ms` reports an
+`executive_reframe_retry` only when that correction path is used.
 
 The deterministic topic resolver is intentionally temporary. A later milestone should replace it with a hybrid semantic resolver while retaining stable topic IDs.
 
 ## Live model providers and output contracts
 
-Every cognitive worker calls an OpenAI-compatible `POST /v1/chat/completions` endpoint. Docker Compose defaults to its bundled Ollama service at `http://ollama:11434/v1`, but each role can independently target another provider through these `.env` variables:
+Every cognitive worker calls an OpenAI-compatible `POST /v1/chat/completions` endpoint. Docker Compose defaults to one bundled Ollama service at `http://ollama:11434/v1`; this is the low-resource option, but it can serialize competing model work. On an NVIDIA-enabled Docker host, enable GPU access for that default provider with:
+
+```powershell
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build -d
+```
+
+Each role can independently target another provider through these `.env` variables:
 
 ```text
 OLLAMA_MODEL
@@ -446,14 +462,24 @@ RIGHT_MODEL_BASE_URL   RIGHT_MODEL_NAME   RIGHT_MODEL_API_KEY   RIGHT_MODEL_TIME
 EXEC_MODEL_BASE_URL    EXEC_MODEL_NAME    EXEC_MODEL_API_KEY    EXEC_MODEL_TIMEOUT_SECONDS    EXEC_MODEL_MAX_TOKENS    EXEC_MODEL_OUTPUT_ATTEMPTS
 ```
 
+For an independent local-provider experiment, apply the dedicated topology:
+
+```powershell
+docker compose -f docker-compose.yml -f docker-compose.dedicated-providers.yml up --build -d
+```
+
+It starts `ollama-left`, `ollama-right`, and `ollama-executive`, reserves NVIDIA GPU access for them, and repoints the three worker containers to their matching provider. It removes the shared scheduler choke point, but can load three copies of the model, so it needs enough available GPU memory. The API includes `cognition.timing_ms` on every chat turn to compare the lobe critical path and executive time between topologies. Confirm the active processor with `docker compose exec ollama-left ollama ps`; a CPU report means provider splitting will usually be slower, not faster.
+
 The workers request documented OpenAI-compatible JSON mode and validate the returned JSON before returning it to the orchestrator. The accepted contracts are intentionally different for each task:
 
 ```text
-left / turn             topic, observations, constraints, strategy, confidence
-right / turn            social read, affect, tone, associations
+left / turn             topic, fact references, constraint codes, action code, confidence
+right / turn            action code, affect, tone code, risk code, association keys
 executive / turn        speech, strategy, typed mutations, memory writes
 executive / reflection  summary, event links, typed mutations
 ```
+
+Left and Right artifacts deliberately use compact semantic keys rather than user-facing sentences. The Executive receives both artifacts and is the only role that turns them into natural language. The repeat review understands both this compact format and historical stored turns from the previous format.
 
 If a provider is unreachable, the model is missing, or its output violates the contract, the worker returns a controlled error and no derived memory or mutation is written. Workers remain stateless; the memory service remains the sole owner of durable character state.
 

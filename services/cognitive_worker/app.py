@@ -2,13 +2,21 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Any
 
 import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import ValidationError
 
-from services.common import CognitiveRequest, CognitiveResponse, ModelOutput, output_model_for
+from services.common import (
+    CognitiveRequest,
+    CognitiveResponse,
+    LeftAnalysis,
+    ModelOutput,
+    RightAnalysis,
+    output_model_for,
+)
 
 ROLE = os.getenv("COGNITIVE_ROLE", "").lower()
 MODEL_BASE_URL = os.getenv("MODEL_BASE_URL", "http://ollama:11434/v1").rstrip("/")
@@ -34,7 +42,7 @@ def _system_prompt(mode: str, output_model: type[ModelOutput], *, corrective_ret
     role_instructions = {
         "left": (
             "You are the analytic hemisphere of a persistent fictional character. "
-            "Identify relevant established facts, consistency constraints, causal implications, and a response strategy. "
+            "Identify relevant established facts, consistency constraints, causal implications, and a response action. "
             "Do not invent canonical facts or propose mutations."
         ),
         "right": (
@@ -47,10 +55,18 @@ def _system_prompt(mode: str, output_model: type[ModelOutput], *, corrective_ret
             "Arbitrate the supplied left and right analyses while maintaining continuity. "
             "Before speaking, inspect context.executive_repeat_review, which is prepared after both "
             "hemispheres finish. Treat semantic_repeat_candidate as a meaningful rephrased-repeat "
-            "signal even when the wording differs. Follow context.conversation_dynamics.response_posture: "
-            "normal means answer neutrally; reclarify means restate or clarify without escalation; "
-            "confused means express sincere, non-accusatory confusion; defensive means set a polite, "
-            "proportionate boundary. This is a tone constraint, not permission to change facts. "
+            "signal even when the wording differs. context.conversation_dynamics contains measured pressure "
+            "and a suggested posture, not a mandatory escalation. Use discretion: simple repeats, requests "
+            "for clarification, or honest confusion normally merit a patient reframe and repeat_escalation=hold. "
+            "Choose repeat_escalation=increase only when the user is clearly pressing an already-sufficient "
+            "answer and the evidence supports proportionate suspicion or defensiveness. Choose deescalate "
+            "when a charged subject is being handled constructively. If context.lobe_execution.mode is reused, "
+            "reuse the supplied analysis and reframe; do not require new lobe reasoning. When "
+            "context.repeat_reframe.required is true, previous_speech is the answer the user just saw: "
+            "your speech must not repeat or closely paraphrase it. Instead, choose a different established "
+            "facet, ask a focused clarification question, or set a proportionate boundary. If repeat_reframe "
+            "contains retry_reason, the preceding attempt was rejected for echoing the answer; correct it now. "
+            "This is not permission to change facts. "
             "Use only supplied character data and memories as established facts. "
             "Never rewrite raw history or immutable core biography. Any state change must be a typed, "
             "evidence-backed mutation proposal."
@@ -63,7 +79,11 @@ def _system_prompt(mode: str, output_model: type[ModelOutput], *, corrective_ret
         else " This is turn mode: produce the character's next spoken response."
     )
     concise_output = (
-        " Keep all text concise. Do not repeat a value. For analytic lists, use at most three short items."
+        " Return a compact semantic control artifact, never user-facing prose or full sentences. "
+        "Use short lower_snake_case or dot-separated keys: fact_refs such as identity.birthplace, "
+        "constraints such as preserve_core, actions such as answer or clarify, and association_keys "
+        "such as cargo.missing. action, intent, tone, and risk should be short labels, not explanations. "
+        "Use at most four list entries."
         if ROLE in {"left", "right"}
         else " Keep the response concise and do not repeat a value."
     )
@@ -85,23 +105,25 @@ def _output_example(output_model: type[ModelOutput]) -> str:
 
     examples = {
         "LeftAnalysis": {
-            "topic": "stable topic identifier",
-            "observations": ["established observation"],
-            "consistency_constraints": ["constraint to preserve"],
-            "recommended_strategy": "brief strategy",
+            "topic": "self.birthplace",
+            "fact_refs": ["identity.birthplace"],
+            "constraints": ["preserve_core"],
+            "action": "answer",
             "confidence": 0.8,
         },
         "RightAnalysis": {
-            "social_read": "social interpretation",
+            "action": "inform",
             "affect": {"curiosity": 0.4, "annoyance": 0.1},
-            "recommended_tone": "patient",
-            "associations": ["relevant association"],
+            "tone": "warm",
+            "risk": "low",
+            "association_keys": ["home.birthplace"],
         },
         "ExecutiveTurn": {
             "goal": "maintain continuity",
             "strategy": "answer using established character context",
             "speech": "The character's spoken response as a plain string.",
             "topic": "stable topic identifier",
+            "repeat_escalation": "hold",
             "mutations": [],
             "memory_writes": [],
         },
@@ -119,6 +141,153 @@ def _json_response_format() -> dict[str, str]:
     """The documented OpenAI-compatible JSON mode supported by Ollama."""
 
     return {"type": "json_object"}
+
+
+def _compact_items(value: Any, limit: int) -> list[str]:
+    """Preserve the first useful model-proposed keys without accepting arbitrary types."""
+
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list):
+        return []
+    return [item.strip() for item in value if isinstance(item, str) and item.strip()][:limit]
+
+
+def _compact_label(value: Any, fallback: str) -> str:
+    if isinstance(value, list) and len(value) == 1:
+        value = value[0]
+    return value.strip() if isinstance(value, str) and value.strip() else fallback
+
+
+def _compact_confidence(value: Any) -> float:
+    try:
+        return max(0.0, min(1.0, float(value)))
+    except (TypeError, ValueError):
+        return 0.5
+
+
+def _distill_compact_artifact(
+    content: str,
+    req: CognitiveRequest,
+    output_model: type[ModelOutput],
+) -> dict[str, Any] | None:
+    """Translate complete legacy or near-miss lobe JSON into the current safe shape.
+
+    This is deliberately limited to Left/Right. It never repairs executive speech,
+    mutations, or memory writes. Unknown model keys are discarded; the resulting
+    artifact is still validated against its Pydantic contract below.
+    """
+
+    if output_model not in {LeftAnalysis, RightAnalysis}:
+        return None
+    try:
+        payload = json.loads(content)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    interaction = req.context.get("interaction", {})
+    fallback_topic = interaction.get("topic") if isinstance(interaction, dict) else None
+    if output_model is LeftAnalysis:
+        return {
+            "topic": _compact_label(payload.get("topic"), str(fallback_topic or "topic.general")),
+            "fact_refs": _compact_items(payload.get("fact_refs", payload.get("observations", [])), 4),
+            "constraints": _compact_items(
+                payload.get("constraints", payload.get("consistency_constraints", [])), 3
+            ),
+            "action": _compact_label(
+                payload.get("action", payload.get("recommended_strategy")), "answer"
+            ),
+            "confidence": _compact_confidence(payload.get("confidence")),
+        }
+    return {
+        "action": _compact_label(payload.get("action", payload.get("intent")), "inform"),
+        "affect": payload.get("affect") if isinstance(payload.get("affect"), dict) else {},
+        "tone": _compact_label(payload.get("tone", payload.get("recommended_tone")), "neutral"),
+        "risk": _compact_label(payload.get("risk"), "low"),
+        "association_keys": _compact_items(payload.get("association_keys", payload.get("associations", [])), 4),
+    }
+
+
+def _partial_string_field(content: str, field_name: str) -> str | None:
+    match = re.search(rf'"{re.escape(field_name)}"\s*:\s*"((?:\\.|[^"\\])*)"', content)
+    if not match:
+        return None
+    try:
+        value = json.loads(f'"{match.group(1)}"')
+    except ValueError:
+        return None
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _partial_string_array(content: str, field_name: str, limit: int) -> list[str]:
+    match = re.search(rf'"{re.escape(field_name)}"\s*:\s*\[([^\]]*)', content, flags=re.DOTALL)
+    if not match:
+        return []
+    items: list[str] = []
+    for raw in re.findall(r'"((?:\\.|[^"\\])*)"', match.group(1)):
+        try:
+            value = json.loads(f'"{raw}"')
+        except ValueError:
+            continue
+        if isinstance(value, str) and value.strip():
+            items.append(value.strip())
+        if len(items) == limit:
+            break
+    return items
+
+
+def _recover_interrupted_lobe_json(
+    content: str,
+    req: CognitiveRequest,
+    output_model: type[ModelOutput],
+) -> dict[str, Any] | None:
+    """Recover only complete, allowlisted keys from an interrupted lobe object.
+
+    Local models occasionally repeat an array until the generation limit, leaving
+    the JSON unclosed. An Executive response must never be repaired this way,
+    because it can carry user-facing speech and state mutations.
+    """
+
+    if output_model not in {LeftAnalysis, RightAnalysis} or not content.lstrip().startswith("{"):
+        return None
+    interaction = req.context.get("interaction", {})
+    fallback_topic = interaction.get("topic") if isinstance(interaction, dict) else None
+    if output_model is LeftAnalysis:
+        topic = _partial_string_field(content, "topic")
+        fact_refs = _partial_string_array(content, "fact_refs", 4) or _partial_string_array(content, "observations", 4)
+        action = _partial_string_field(content, "action") or _partial_string_field(content, "recommended_strategy")
+        # A topic on its own is too little evidence to trust; it remains a
+        # retryable incomplete completion. A completed fact or action is enough
+        # to recover the bounded lobe artifact safely.
+        if not any((fact_refs, action)):
+            return None
+        confidence_match = re.search(r'"confidence"\s*:\s*(-?(?:\d+(?:\.\d*)?|\.\d+))', content)
+        confidence: Any = confidence_match.group(1) if confidence_match else None
+        return {
+            "topic": topic or str(fallback_topic or "topic.general"),
+            "fact_refs": fact_refs,
+            "constraints": _partial_string_array(content, "constraints", 3)
+            or _partial_string_array(content, "consistency_constraints", 3),
+            "action": action or "answer",
+            "confidence": _compact_confidence(confidence),
+        }
+
+    action = _partial_string_field(content, "action") or _partial_string_field(content, "intent")
+    tone = _partial_string_field(content, "tone") or _partial_string_field(content, "recommended_tone")
+    association_keys = _partial_string_array(content, "association_keys", 4) or _partial_string_array(
+        content, "associations", 4
+    )
+    if not any((action, tone, association_keys)):
+        return None
+    return {
+        "action": action or "inform",
+        "affect": {},
+        "tone": tone or "neutral",
+        "risk": _partial_string_field(content, "risk") or "low",
+        "association_keys": association_keys,
+    }
 
 
 def _model_headers() -> dict[str, str]:
@@ -175,7 +344,10 @@ async def _request_model(req: CognitiveRequest, output_model: type[ModelOutput])
     for attempt in range(MODEL_OUTPUT_ATTEMPTS):
         content = await _request_completion(req, output_model, corrective_retry=attempt > 0)
         try:
-            return output_model.model_validate_json(content)
+            distilled = _distill_compact_artifact(content, req, output_model)
+            if distilled is None:
+                distilled = _recover_interrupted_lobe_json(content, req, output_model)
+            return output_model.model_validate(distilled) if distilled is not None else output_model.model_validate_json(content)
         except ValidationError:
             if attempt + 1 < MODEL_OUTPUT_ATTEMPTS:
                 continue

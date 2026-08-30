@@ -9,7 +9,7 @@ from fastapi import HTTPException
 os.environ.setdefault("COGNITIVE_ROLE", "left")
 
 from services.cognitive_worker import app as worker  # noqa: E402
-from services.common import CognitiveRequest, LeftAnalysis  # noqa: E402
+from services.common import CognitiveRequest, LeftAnalysis, RightAnalysis  # noqa: E402
 
 
 def test_worker_retries_an_incomplete_json_completion(monkeypatch: pytest.MonkeyPatch):
@@ -17,9 +17,9 @@ def test_worker_retries_an_incomplete_json_completion(monkeypatch: pytest.Monkey
         [
             '{"topic":"topic.general","observations":["partial',
             (
-                '{"topic":"topic.general","observations":["established fact"],'
-                '"consistency_constraints":["preserve biography"],'
-                '"recommended_strategy":"answer concisely","confidence":0.8}'
+                '{"topic":"topic.general","fact_refs":["identity.name"],'
+                '"constraints":["preserve_core"],'
+                '"action":"answer","confidence":0.8}'
             ),
         ]
     )
@@ -48,3 +48,44 @@ def test_worker_hides_raw_contract_trace_after_retries(monkeypatch: pytest.Monke
         asyncio.run(worker._request_model(request, LeftAnalysis))
 
     assert exc_info.value.status_code == 502
+
+
+def test_worker_distills_complete_legacy_lobe_json(monkeypatch: pytest.MonkeyPatch):
+    responses = iter([
+        (
+            '{"topic":"self.occupation","observations":["identity.occupation"],'
+            '"consistency_constraints":["preserve_core"],'
+            '"recommended_strategy":"answer","confidence":0.8}'
+        ),
+        (
+            '{"social_read":"ordinary_exchange","affect":{"curiosity":0.5},'
+            '"recommended_tone":"warm","associations":["occupation.work"]}'
+        ),
+    ])
+
+    async def legacy_completion(*_args, **_kwargs) -> str:
+        return next(responses)
+
+    monkeypatch.setattr(worker, "_request_completion", legacy_completion)
+    request = CognitiveRequest.model_construct(context={"interaction": {"topic": "self.occupation"}})
+
+    left = asyncio.run(worker._request_model(request, LeftAnalysis))
+    right = asyncio.run(worker._request_model(request, RightAnalysis))
+
+    assert left.fact_refs == ["identity.occupation"]
+    assert right.action == "inform"
+    assert right.association_keys == ["occupation.work"]
+
+
+def test_worker_recovers_allowlisted_fields_from_interrupted_lobe_json(monkeypatch: pytest.MonkeyPatch):
+    async def interrupted_completion(*_args, **_kwargs) -> str:
+        return '{"topic":"topic.missing_cargo","observations":["missing cargo","lost shipment"'
+
+    monkeypatch.setattr(worker, "_request_completion", interrupted_completion)
+    request = CognitiveRequest.model_construct(context={"interaction": {"topic": "topic.cargo"}})
+
+    result = asyncio.run(worker._request_model(request, LeftAnalysis))
+
+    assert result.topic == "topic.missing_cargo"
+    assert result.fact_refs == ["missing cargo", "lost shipment"]
+    assert result.action == "answer"

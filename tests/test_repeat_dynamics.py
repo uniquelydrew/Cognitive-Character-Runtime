@@ -1,5 +1,10 @@
 from services.common import CharacterDocument
-from services.orchestrator.app import apply_repeat_posture, derive_repeat_dynamics, executive_repeat_review
+from services.orchestrator.app import (
+    derive_repeat_dynamics,
+    executive_repeat_review,
+    immediate_repeat_lobe_reuse,
+    response_substantially_repeats_prior_answer,
+)
 
 
 CHARACTER = CharacterDocument.model_validate(
@@ -105,6 +110,57 @@ def test_executive_review_uses_subject_anchors_when_lobe_topic_labels_differ():
     assert review["confidence"] == 0.76
 
 
+def test_executive_review_uses_compact_fact_reference_without_losing_dotted_key():
+    review = executive_repeat_review(
+        message="Could you explain that place again?",
+        topic="topic.explain.place",
+        current_event_id="evt_current",
+        session_events=[
+            {
+                "id": "evt_previous",
+                "event_type": "user_message",
+                "content": "Where were you born?",
+                "topic": "self.birthplace",
+                "metadata": {},
+            },
+            {
+                "id": "evt_reply",
+                "event_type": "character_message",
+                "content": "I was born in Greyhaven.",
+                "topic": "self.birthplace",
+                "metadata": {
+                    "responds_to": "evt_previous",
+                    "left": {
+                        "topic": "birthplace",
+                        "fact_refs": ["identity.birthplace"],
+                        "constraints": ["preserve_core"],
+                        "action": "answer",
+                    },
+                },
+            },
+            {
+                "id": "evt_current",
+                "event_type": "user_message",
+                "content": "Could you explain that place again?",
+                "topic": "topic.explain.place",
+                "metadata": {},
+            },
+        ],
+        left_result={
+            "topic": "place.explanation",
+            "fact_refs": ["identity.birthplace"],
+            "constraints": ["preserve_core"],
+            "action": "reclarify",
+        },
+        right_result={"association_keys": []},
+        prior_times=0,
+    )
+
+    assert review["semantic_repeat_candidate"] is True
+    assert review["reason"] == "left analyses reference the same established fact"
+    assert review["confidence"] == 0.78
+
+
 def test_executive_review_keeps_the_prior_semantic_subject_key():
     review = executive_repeat_review(
         message="Could you say that another way?",
@@ -146,7 +202,111 @@ def test_executive_review_keeps_the_prior_semantic_subject_key():
     assert review["subject_key"] == "self.birthplace"
 
 
-def test_repeat_dynamics_preserve_subject_pressure_and_intersect_with_patience():
+def test_executive_review_ignores_a_prior_user_turn_without_a_reply():
+    review = executive_repeat_review(
+        message="Where was it again?",
+        topic="self.birthplace",
+        current_event_id="evt_current",
+        session_events=[
+            {
+                "id": "evt_unanswered",
+                "event_type": "user_message",
+                "content": "Where were you born?",
+                "topic": "self.birthplace",
+                "metadata": {},
+            },
+            {
+                "id": "evt_current",
+                "event_type": "user_message",
+                "content": "Where was it again?",
+                "topic": "self.birthplace",
+                "metadata": {},
+            },
+        ],
+        left_result={"topic": "self.birthplace"},
+        right_result={"association_keys": []},
+        prior_times=0,
+    )
+
+    assert review["semantic_repeat_candidate"] is False
+
+
+def test_immediate_answered_exact_repeat_reuses_prior_lobe_artifacts():
+    reuse = immediate_repeat_lobe_reuse(
+        message="Where were you born?",
+        topic="self.birthplace",
+        session_events=[
+            {
+                "id": "evt_question",
+                "event_type": "user_message",
+                "content": "Where were you born?",
+                "topic": "self.birthplace",
+                "metadata": {},
+            },
+            {
+                "id": "evt_reply",
+                "event_type": "character_message",
+                "content": "Northbridge.",
+                "topic": "self.birthplace",
+                "metadata": {
+                    "responds_to": "evt_question",
+                    "left": {"topic": "self.birthplace", "action": "answer"},
+                    "right": {"action": "inform", "tone": "warm"},
+                },
+            },
+        ],
+    )
+
+    assert reuse is not None
+    assert reuse["reason"] == "immediate_answered_exact_repeat"
+    assert reuse["left"]["action"] == "answer"
+    assert reuse["prior_speech"] == "Northbridge."
+
+
+def test_repeat_reframe_guard_catches_a_close_paraphrase_but_allows_a_new_angle():
+    prior = "As a harbormaster, my duty is to protect the port and its workers."
+
+    assert response_substantially_repeats_prior_answer(
+        "Protecting the port and its workers is my top priority as harbormaster.",
+        prior,
+    )
+    assert not response_substantially_repeats_prior_answer(
+        "The dawn watch is where I make that responsibility practical. Is there a particular decision you mean?",
+        prior,
+    )
+
+
+def test_rephrased_or_unanswered_turns_do_not_bypass_lobe_reasoning():
+    events = [
+        {
+            "id": "evt_question",
+            "event_type": "user_message",
+            "content": "Where were you born?",
+            "topic": "self.birthplace",
+            "metadata": {},
+        },
+        {
+            "id": "evt_reply",
+            "event_type": "character_message",
+            "content": "Northbridge.",
+            "topic": "self.birthplace",
+            "metadata": {
+                "responds_to": "evt_question",
+                "left": {"topic": "self.birthplace"},
+                "right": {"action": "inform"},
+            },
+        },
+    ]
+
+    assert immediate_repeat_lobe_reuse(
+        message="What is your hometown?", topic="self.birthplace", session_events=events
+    ) is None
+    assert immediate_repeat_lobe_reuse(
+        message="Where were you born?", topic="self.birthplace", session_events=events[:1]
+    ) is None
+
+
+def test_repeat_dynamics_preserve_subject_pressure_and_require_executive_escalation():
     state: dict[str, object] = {}
     baseline, _, _ = derive_repeat_dynamics(
         character=CHARACTER,
@@ -166,36 +326,52 @@ def test_repeat_dynamics_preserve_subject_pressure_and_intersect_with_patience()
         "confidence": 0.84,
     }
 
-    first_repeat, topics, changed = derive_repeat_dynamics(
+    held_repeat, topics, changed = derive_repeat_dynamics(
         character=CHARACTER,
         mutable_state=state,
         review=repeat_review,
         user_turn_count=2,
     )
-    assert changed is True
-    assert first_repeat.response_posture == "reclarify"
-    assert first_repeat.subject_defensiveness > 0
+    assert changed is False
+    assert held_repeat.response_posture == "reclarify"
+    assert held_repeat.suggested_posture == "reclarify"
+    assert held_repeat.escalation_recommendation == "increase"
+    assert held_repeat.subject_defensiveness == 0
 
-    second_repeat, topics, _ = derive_repeat_dynamics(
+    increased_repeat, topics, changed = derive_repeat_dynamics(
+        character=CHARACTER,
+        mutable_state=state,
+        review=repeat_review,
+        user_turn_count=2,
+        escalation_decision="increase",
+    )
+    assert changed is True
+    assert increased_repeat.subject_defensiveness > 0
+    assert increased_repeat.response_posture == "reclarify"
+
+    escalated_again, topics, _ = derive_repeat_dynamics(
         character=CHARACTER,
         mutable_state={"topic_defensiveness": topics},
         review={**repeat_review, "consecutive_repeats": 3},
         user_turn_count=3,
+        escalation_decision="increase",
     )
-    assert second_repeat.response_posture == "confused"
+    assert escalated_again.response_posture == "confused"
 
-    third_repeat, topics, _ = derive_repeat_dynamics(
+    held_after_increase, preserved_topics, changed = derive_repeat_dynamics(
         character=CHARACTER,
         mutable_state={"topic_defensiveness": topics},
         review={**repeat_review, "consecutive_repeats": 4},
         user_turn_count=4,
     )
-    assert third_repeat.response_posture == "defensive"
-    assert third_repeat.conversation_patience < first_repeat.conversation_patience
+    assert changed is False
+    assert held_after_increase.subject_defensiveness == topics["topic.missing_cargo"]
+    assert held_after_increase.suggested_posture == "defensive"
+    assert held_after_increase.conversation_patience < held_repeat.conversation_patience
 
     new_subject, preserved_topics, _ = derive_repeat_dynamics(
         character=CHARACTER,
-        mutable_state={"topic_defensiveness": topics},
+        mutable_state={"topic_defensiveness": preserved_topics},
         review={
             "semantic_repeat_candidate": False,
             "subject_key": "topic.weather",
@@ -209,31 +385,3 @@ def test_repeat_dynamics_preserve_subject_pressure_and_intersect_with_patience()
     # the session to its original patience baseline.
     assert new_subject.conversation_patience < baseline.conversation_patience
     assert preserved_topics["topic.missing_cargo"] == topics["topic.missing_cargo"]
-
-
-def test_repeat_posture_guard_makes_escalation_visible():
-    confused, _, _ = derive_repeat_dynamics(
-        character=CHARACTER,
-        mutable_state={"topic_defensiveness": {"topic.cargo": 0.24}},
-        review={
-            "semantic_repeat_candidate": True,
-            "subject_key": "topic.cargo",
-            "consecutive_repeats": 3,
-            "confidence": 0.8,
-        },
-        user_turn_count=3,
-    )
-    defensive, _, _ = derive_repeat_dynamics(
-        character=CHARACTER,
-        mutable_state={"topic_defensiveness": {"topic.cargo": confused.subject_defensiveness}},
-        review={
-            "semantic_repeat_candidate": True,
-            "subject_key": "topic.cargo",
-            "consecutive_repeats": 4,
-            "confidence": 0.8,
-        },
-        user_turn_count=4,
-    )
-
-    assert "confused" in apply_repeat_posture("Greyhaven.", confused).lower()
-    assert "already answered" in apply_repeat_posture("Greyhaven.", defensive).lower()

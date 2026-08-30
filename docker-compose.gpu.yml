@@ -1,0 +1,13 @@
+# Optional GPU acceleration for the default shared-provider stack.
+# Requires an NVIDIA-enabled Docker daemon. Start with:
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up --build -d
+
+services:
+  ollama:
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

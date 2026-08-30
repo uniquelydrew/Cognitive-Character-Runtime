@@ -45,17 +45,18 @@ def completions(body: dict[str, Any]) -> dict[str, Any]:
     if "analytic hemisphere" in system_prompt:
         result = {
             "topic": interaction.get("topic", "topic.general"),
-            "observations": [],
-            "consistency_constraints": [],
-            "recommended_strategy": "answer_from_established_context",
+            "fact_refs": [],
+            "constraints": ["preserve_core"],
+            "action": "answer",
             "confidence": 0.8,
         }
     elif "associative and social hemisphere" in system_prompt:
         result = {
-            "social_read": "repetition_noticed" if interaction.get("times_asked") else "ordinary_exchange",
+            "action": "reclarify" if interaction.get("times_asked") else "inform",
             "affect": {"annoyance": 0.1, "curiosity": 0.5},
-            "recommended_tone": "patient",
-            "associations": [],
+            "tone": "patient",
+            "risk": "low",
+            "association_keys": [],
         }
     elif "reflection mode" not in system_prompt:
         answer = interaction.get("prior_answer") or _answer(request) or "I do not have enough established information."
@@ -66,6 +67,7 @@ def completions(body: dict[str, Any]) -> dict[str, Any]:
             "strategy": "reuse_prior_commitment" if interaction.get("prior_answer") else "answer_from_character_state",
             "speech": speech,
             "topic": interaction.get("topic", "topic.general"),
+            "repeat_escalation": "hold",
             "mutations": [],
             "memory_writes": [{
                 "kind": "self_history",
