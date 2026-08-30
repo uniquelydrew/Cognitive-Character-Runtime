@@ -3,148 +3,162 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <meta name="theme-color" content="#101817" />
   <title>Cognitive Character Runtime</title>
   <style>
-    :root { font-family: Inter, system-ui, sans-serif; color-scheme: dark; }
-    body { margin: 0; background: #111318; color: #e8eaf0; }
-    .app { display: grid; grid-template-rows: auto 1fr; height: 100vh; }
-    header { padding: 12px 16px; border-bottom: 1px solid #30343d; display: flex; gap: 12px; align-items: center; }
-    header strong { margin-right: auto; }
-    select, button, textarea { background: #1b1f27; color: #e8eaf0; border: 1px solid #3b414c; border-radius: 6px; }
-    button { padding: 8px 12px; cursor: pointer; }
-    button:disabled { opacity: .45; cursor: default; }
-    main { display: grid; grid-template-columns: minmax(0, 1fr) 420px; min-height: 0; }
-    .chat { display: grid; grid-template-rows: 1fr auto; min-height: 0; }
-    #messages { overflow: auto; padding: 18px; }
-    .message { max-width: 78%; padding: 10px 12px; margin: 8px 0; border-radius: 10px; white-space: pre-wrap; }
-    .user { margin-left: auto; background: #293246; }
-    .character { background: #23272f; }
-    .composer { border-top: 1px solid #30343d; padding: 12px; display: grid; grid-template-columns: 1fr auto; gap: 10px; }
-    textarea { resize: none; min-height: 58px; padding: 10px; }
-    .debug { border-left: 1px solid #30343d; overflow: auto; padding: 12px; background: #0d0f13; }
-    .panel { margin-bottom: 12px; }
-    .panel h3 { font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: #aeb5c2; }
-    pre { font-size: 12px; line-height: 1.4; white-space: pre-wrap; word-break: break-word; background: #16191f; padding: 10px; border-radius: 6px; }
-    .status { font-size: 12px; color: #aeb5c2; }
-    @media (max-width: 900px) { main { grid-template-columns: 1fr; } .debug { display: none; } }
+    :root { font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #edf6f2; background: #0d1413; color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body { min-width: 320px; min-height: 100vh; margin: 0; background: radial-gradient(circle at 18% 0%, #19302c 0, #0d1413 38rem); }
+    button, select, textarea { font: inherit; }
+    button { border: 0; cursor: pointer; }
+    button:focus-visible, select:focus-visible, textarea:focus-visible, summary:focus-visible { outline: 3px solid #75d8bd; outline-offset: 3px; }
+    button:disabled, select:disabled { cursor: not-allowed; opacity: .5; }
+    .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+    .app { min-height: 100vh; }
+    .topbar { min-height: 72px; display: flex; align-items: center; gap: 20px; padding: 14px clamp(18px, 4vw, 56px); border-bottom: 1px solid rgba(206, 238, 228, .12); background: rgba(13, 20, 19, .82); backdrop-filter: blur(16px); }
+    .brand { display: flex; align-items: center; gap: 11px; color: #f4fbf8; font-weight: 750; letter-spacing: -.02em; text-decoration: none; }
+    .brand-mark { width: 30px; height: 30px; display: grid; place-items: center; border: 1px solid rgba(139, 224, 196, .46); border-radius: 10px; color: #8be0c4; background: rgba(77, 161, 136, .12); font-size: 17px; }
+    .topbar-spacer { flex: 1; }
+    .health { display: inline-flex; align-items: center; gap: 8px; color: #b8c9c2; font-size: 13px; }
+    .health-dot { width: 8px; height: 8px; border-radius: 50%; background: #d5a646; box-shadow: 0 0 0 4px rgba(213, 166, 70, .12); }
+    .health-dot.ready { background: #6bd4b3; box-shadow: 0 0 0 4px rgba(107, 212, 179, .12); }
+    .health-dot.error { background: #e27d7d; box-shadow: 0 0 0 4px rgba(226, 125, 125, .12); }
+    .layout { width: min(1440px, 100%); min-height: calc(100vh - 72px); display: grid; grid-template-columns: 290px minmax(0, 1fr) 250px; gap: 28px; margin: 0 auto; padding: 28px clamp(18px, 4vw, 56px) 36px; }
+    .character-rail, .context-rail { min-width: 0; }
+    .character-rail { display: flex; flex-direction: column; gap: 16px; }
+    .eyebrow { margin: 0 0 7px; color: #8be0c4; font-size: 11px; font-weight: 800; letter-spacing: .11em; text-transform: uppercase; }
+    .character-picker { width: 100%; appearance: none; padding: 12px 38px 12px 13px; border: 1px solid rgba(206, 238, 228, .18); border-radius: 12px; color: #eef7f3; background: #172220 url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='18' height='18' fill='none' stroke='%238be0c4' stroke-linecap='round' stroke-linejoin='round' stroke-width='2'%3E%3Cpath d='m5 7 4 4 4-4'/%3E%3C/svg%3E") right 11px center / 18px no-repeat; cursor: pointer; }
+    .character-picker option { color: #111; background: #fff; }
+    .character-card { overflow: hidden; border: 1px solid rgba(206, 238, 228, .12); border-radius: 18px; background: linear-gradient(150deg, rgba(35, 58, 52, .76), rgba(19, 30, 28, .9)); box-shadow: 0 20px 45px rgba(0, 0, 0, .12); }
+    .portrait { height: 122px; display: flex; align-items: end; padding: 18px; background: linear-gradient(140deg, rgba(66, 139, 117, .46), rgba(27, 47, 43, .1)), radial-gradient(circle at 25% 20%, #7bc8af, #2d5148 52%, #172421); }
+    .portrait-initials { width: 56px; height: 56px; display: grid; place-items: center; border: 1px solid rgba(255,255,255,.32); border-radius: 18px; color: white; background: rgba(13, 28, 25, .42); box-shadow: 0 8px 22px rgba(0,0,0,.2); font-size: 21px; font-weight: 800; letter-spacing: -.05em; }
+    .character-copy { padding: 18px; }
+    .character-copy h1 { margin: 0; color: #f5fbf8; font-size: 22px; letter-spacing: -.035em; }
+    .character-role { margin: 5px 0 14px; color: #9cc7b9; font-size: 14px; }
+    .bio { margin: 0; color: #c0d0cb; font-size: 13px; line-height: 1.55; }
+    .fact-list { display: grid; gap: 9px; margin: 17px 0 0; padding: 14px 0 0; border-top: 1px solid rgba(206, 238, 228, .1); }
+    .fact { display: flex; justify-content: space-between; gap: 10px; color: #a7bbb4; font-size: 12px; }
+    .fact strong { color: #e0ece7; font-weight: 650; text-align: right; }
+    .new-button, .secondary-button, .chip, .send-button { border-radius: 12px; transition: transform .16s ease, background .16s ease, border-color .16s ease; }
+    .new-button:hover:not(:disabled), .secondary-button:hover:not(:disabled), .chip:hover:not(:disabled), .send-button:hover:not(:disabled) { transform: translateY(-1px); }
+    .new-button { width: 100%; padding: 12px 14px; color: #08211a; background: #8be0c4; font-weight: 760; }
+    .new-button:hover:not(:disabled) { background: #a3ecd4; }
+    .secondary-button { padding: 9px 12px; color: #c5ddd5; border: 1px solid rgba(206, 238, 228, .18); background: rgba(24, 37, 34, .7); font-size: 13px; }
+    .conversation { min-width: 0; display: grid; grid-template-rows: auto minmax(360px, 1fr) auto; overflow: hidden; border: 1px solid rgba(206, 238, 228, .12); border-radius: 22px; background: rgba(18, 28, 26, .84); box-shadow: 0 20px 60px rgba(0, 0, 0, .18); }
+    .conversation-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 20px 22px 16px; border-bottom: 1px solid rgba(206, 238, 228, .1); }
+    .conversation-head h2 { margin: 0; color: #f3fbf7; font-size: 17px; letter-spacing: -.02em; }
+    .conversation-subtitle { margin: 4px 0 0; color: #8ca79d; font-size: 12px; }
+    .head-actions { display: flex; align-items: center; gap: 10px; flex: 0 0 auto; }
+    .session-state { display: inline-flex; align-items: center; gap: 7px; flex: 0 0 auto; color: #a7c5bb; font-size: 12px; }
+    .session-state .health-dot { width: 7px; height: 7px; }
+    #messages { min-height: 0; overflow: auto; padding: 26px clamp(18px, 4vw, 42px); scroll-behavior: smooth; }
+    .welcome { max-width: 610px; margin: 8vh auto 0; text-align: center; }
+    .welcome-orb { width: 64px; height: 64px; display: grid; place-items: center; margin: 0 auto 17px; border: 1px solid rgba(139, 224, 196, .45); border-radius: 22px; color: #8be0c4; background: linear-gradient(145deg, rgba(75, 153, 129, .23), rgba(30, 55, 49, .38)); font-size: 25px; box-shadow: 0 16px 38px rgba(0,0,0,.2); }
+    .welcome h3 { margin: 0; color: #f1faf6; font-size: clamp(24px, 3.4vw, 34px); letter-spacing: -.045em; }
+    .welcome p { max-width: 480px; margin: 11px auto 21px; color: #adc1b9; line-height: 1.6; }
+    .starter-list { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; }
+    .chip { max-width: 100%; padding: 9px 12px; color: #cee6dd; border: 1px solid rgba(139, 224, 196, .21); background: rgba(44, 83, 72, .28); font-size: 13px; text-align: left; }
+    .chip:hover:not(:disabled) { border-color: rgba(139, 224, 196, .55); background: rgba(57, 107, 92, .38); }
+    .message { max-width: min(82%, 680px); margin: 0 0 16px; padding: 13px 15px; border-radius: 17px; line-height: 1.55; animation: enter .2s ease both; white-space: pre-wrap; }
+    @keyframes enter { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
+    .message-label { display: block; margin-bottom: 5px; color: #94b8ac; font-size: 11px; font-weight: 750; letter-spacing: .07em; text-transform: uppercase; }
+    .message.user { margin-left: auto; border-bottom-right-radius: 5px; color: #f3fbf7; background: #2c5c50; }
+    .message.character { border: 1px solid rgba(206, 238, 228, .1); border-bottom-left-radius: 5px; color: #e5f1ec; background: #1b2927; }
+    .message.system { max-width: 100%; display: flex; align-items: flex-start; gap: 10px; margin: 4px 0 16px; padding: 11px 13px; border: 1px solid rgba(220, 177, 89, .2); border-radius: 12px; color: #d9c99f; background: rgba(95, 70, 29, .16); font-size: 13px; }
+    .message.system.error { border-color: rgba(226, 125, 125, .3); color: #f1b5b5; background: rgba(111, 44, 44, .19); }
+    .retry-button { padding: 0; color: #f1dba4; background: transparent; text-decoration: underline; }
+    .typing { display: inline-flex; align-items: center; gap: 6px; margin: 0 0 16px; padding: 10px 13px; border: 1px solid rgba(206, 238, 228, .1); border-radius: 14px; color: #a9c6bc; background: #182523; font-size: 13px; }
+    .typing-dots { display: inline-flex; gap: 3px; }
+    .typing-dots i { width: 4px; height: 4px; border-radius: 50%; background: #8be0c4; animation: pulse 1.15s infinite ease-in-out; }
+    .typing-dots i:nth-child(2) { animation-delay: .15s; } .typing-dots i:nth-child(3) { animation-delay: .3s; }
+    @keyframes pulse { 0%, 60%, 100% { transform: translateY(0); opacity: .35; } 30% { transform: translateY(-3px); opacity: 1; } }
+    .composer-wrap { padding: 14px 18px 17px; border-top: 1px solid rgba(206, 238, 228, .1); background: rgba(13, 21, 19, .48); }
+    .composer { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; align-items: end; padding: 8px; border: 1px solid rgba(206, 238, 228, .17); border-radius: 16px; background: #121e1c; }
+    .composer:focus-within { border-color: rgba(139, 224, 196, .6); box-shadow: 0 0 0 3px rgba(139, 224, 196, .09); }
+    #input { width: 100%; min-height: 43px; max-height: 130px; padding: 10px; resize: vertical; border: 0; outline: 0; color: #ecf7f2; background: transparent; line-height: 1.4; }
+    #input::placeholder { color: #718a80; }
+    .send-button { min-width: 86px; min-height: 43px; padding: 10px 15px; color: #062018; background: #8be0c4; font-size: 13px; font-weight: 800; }
+    .send-button:hover:not(:disabled) { background: #a3ecd4; }
+    .composer-hint { display: flex; justify-content: space-between; gap: 16px; margin: 9px 3px 0; color: #758e84; font-size: 11px; }
+    .context-rail { display: flex; flex-direction: column; gap: 14px; padding-top: 4px; }
+    .context-card { padding: 16px; border: 1px solid rgba(206, 238, 228, .12); border-radius: 16px; background: rgba(22, 35, 32, .7); }
+    .context-card h3 { margin: 0 0 9px; color: #d5e7e0; font-size: 13px; }
+    .context-card p { margin: 0; color: #95afa5; font-size: 12px; line-height: 1.55; }
+    .pill-list { display: flex; flex-wrap: wrap; gap: 6px; }
+    .pill { padding: 5px 8px; border: 1px solid rgba(139, 224, 196, .16); border-radius: 999px; color: #b4d2c7; background: rgba(53, 94, 81, .2); font-size: 11px; }
+    .detail-panel { overflow: hidden; border: 1px solid rgba(206, 238, 228, .12); border-radius: 15px; background: rgba(18, 29, 27, .64); }
+    .detail-panel summary { padding: 13px 15px; color: #a9c8bd; cursor: pointer; font-size: 12px; font-weight: 700; }
+    .detail-panel[open] summary { border-bottom: 1px solid rgba(206, 238, 228, .1); }
+    .detail-content { padding: 13px 15px; }
+    .detail-content dl { display: grid; gap: 9px; margin: 0; }
+    .detail-content div { display: grid; gap: 2px; }
+    .detail-content dt { color: #789187; font-size: 10px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
+    .detail-content dd { margin: 0; color: #c8dcd4; font-size: 12px; overflow-wrap: anywhere; }
+    .reflection { display: none; border-left: 3px solid #8be0c4; }
+    .reflection.visible { display: block; }
+    @media (max-width: 1120px) { .layout { grid-template-columns: 270px minmax(0, 1fr); } .context-rail { display: none; } }
+    @media (max-width: 760px) { .topbar { min-height: 62px; padding: 12px 18px; } .brand { font-size: 14px; } .health { font-size: 11px; } .layout { display: flex; flex-direction: column; gap: 16px; padding: 18px; } .character-rail { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: start; } .character-rail > .eyebrow { grid-column: 1 / -1; } .character-picker { min-width: 0; } .character-card { grid-column: 1 / -1; display: grid; grid-template-columns: 92px 1fr; } .portrait { height: 100%; min-height: 110px; padding: 14px; } .portrait-initials { width: 46px; height: 46px; border-radius: 14px; font-size: 17px; } .character-copy { padding: 15px; } .bio { display: -webkit-box; overflow: hidden; -webkit-box-orient: vertical; -webkit-line-clamp: 2; } .fact-list { display: none; } .new-button { width: auto; align-self: end; } .conversation { min-height: 540px; } .conversation-head { flex-wrap: wrap; padding: 17px; } .head-actions { width: 100%; justify-content: space-between; } #messages { padding: 19px 17px; } .welcome { margin-top: 4vh; } .message { max-width: 92%; } .composer-wrap { padding: 11px; } .composer-hint span:last-child { display: none; } }
+    @media (max-width: 430px) { .health { display: none; } .character-rail { grid-template-columns: 1fr; } .new-button { width: 100%; } .character-card { grid-column: auto; } .composer { grid-template-columns: 1fr; } .send-button { width: 100%; } }
   </style>
 </head>
 <body>
-<div class="app">
-  <header>
-    <strong>Cognitive Character Runtime</strong>
-    <label>Character <select id="character"></select></label>
-    <button id="newSession">New interaction</button>
-    <button id="reflect" disabled>Reflect</button>
-    <button id="close" disabled>End interaction</button>
-    <span class="status" id="status">Loading…</span>
-  </header>
-  <main>
-    <section class="chat">
-      <div id="messages"></div>
-      <div class="composer">
-        <textarea id="input" placeholder="Message the active character…"></textarea>
-        <button id="send" disabled>Send</button>
-      </div>
-    </section>
-    <aside class="debug">
-      <div class="panel"><h3>Interaction</h3><pre id="interaction">—</pre></div>
-      <div class="panel"><h3>Left</h3><pre id="left">—</pre></div>
-      <div class="panel"><h3>Right</h3><pre id="right">—</pre></div>
-      <div class="panel"><h3>Executive</h3><pre id="executive">—</pre></div>
-      <div class="panel"><h3>Reflection</h3><pre id="reflection">—</pre></div>
-    </aside>
-  </main>
-</div>
-<script>
-const $ = id => document.getElementById(id);
-let sessionId = null;
-
-async function api(path, options={}) {
-  const res = await fetch('/api' + path, {headers:{'Content-Type':'application/json'}, ...options});
-  if (!res.ok) throw new Error(await res.text());
-  return res.json();
-}
-
-function pretty(v) { return JSON.stringify(v, null, 2); }
-function addMessage(text, cls) {
-  const el = document.createElement('div');
-  el.className = 'message ' + cls;
-  el.textContent = text;
-  $('messages').appendChild(el);
-  $('messages').scrollTop = $('messages').scrollHeight;
-}
-function setActive(active) {
-  $('send').disabled = !active;
-  $('reflect').disabled = !active;
-  $('close').disabled = !active;
-}
-
-async function loadCharacters() {
-  const chars = await api('/characters');
-  $('character').innerHTML = '';
-  for (const c of chars) {
-    const o = document.createElement('option');
-    o.value = c.id; o.textContent = c.identity.name || c.id;
-    $('character').appendChild(o);
-  }
-  $('status').textContent = chars.length ? 'Ready' : 'No character primers found';
-}
-
-async function newSession() {
-  const character_id = $('character').value;
-  if (!character_id) return;
-  const s = await api('/sessions', {method:'POST', body:JSON.stringify({character_id})});
-  sessionId = s.id;
-  $('messages').innerHTML = '';
-  ['interaction','left','right','executive','reflection'].forEach(id => $(id).textContent = '—');
-  $('status').textContent = sessionId;
-  setActive(true);
-}
-
-async function send() {
-  const message = $('input').value.trim();
-  if (!message || !sessionId) return;
-  $('input').value = '';
-  addMessage(message, 'user');
-  $('send').disabled = true;
-  try {
-    const out = await api(`/sessions/${sessionId}/chat`, {method:'POST', body:JSON.stringify({message})});
-    addMessage(out.message, 'character');
-    $('interaction').textContent = pretty(out.interaction);
-    $('left').textContent = pretty(out.cognition.left);
-    $('right').textContent = pretty(out.cognition.right);
-    $('executive').textContent = pretty(out.cognition.executive);
-  } catch (e) {
-    addMessage('ERROR: ' + e.message, 'character');
-  } finally {
-    $('send').disabled = false;
-  }
-}
-
-async function reflect() {
-  if (!sessionId) return;
-  const out = await api(`/sessions/${sessionId}/reflect`, {method:'POST', body:'{}'});
-  $('reflection').textContent = pretty(out);
-}
-
-async function closeInteraction() {
-  if (!sessionId) return;
-  const out = await api(`/sessions/${sessionId}/close`, {method:'POST', body:'{}'});
-  $('reflection').textContent = pretty(out.reflection);
-  $('status').textContent = 'Interaction closed';
-  setActive(false);
-  sessionId = null;
-}
-
-$('newSession').onclick = newSession;
-$('send').onclick = send;
-$('reflect').onclick = reflect;
-$('close').onclick = closeInteraction;
-$('input').addEventListener('keydown', e => {
-  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
-});
-loadCharacters().catch(e => $('status').textContent = e.message);
-</script>
+  <div class="app">
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="Cognitive Character Runtime home"><span class="brand-mark">✦</span><span>Cognitive Character Runtime</span></a>
+      <div class="topbar-spacer"></div>
+      <a href="/profiles.html" style="color:#b8c9c2;font-size:13px;font-weight:700;text-decoration:none">Manage profiles</a>
+      <div class="health" aria-live="polite"><span class="health-dot" id="healthDot"></span><span id="healthText">Connecting…</span></div>
+    </header>
+    <main class="layout">
+      <aside class="character-rail" aria-label="Character selection">
+        <div><p class="eyebrow">Your conversation</p><label class="sr-only" for="character">Character</label><select class="character-picker" id="character" aria-label="Choose a character"></select></div>
+        <section class="character-card" aria-live="polite">
+          <div class="portrait"><div class="portrait-initials" id="initials">—</div></div>
+          <div class="character-copy"><h1 id="characterName">Choose a character</h1><p class="character-role" id="characterRole">Conversation partner</p><p class="bio" id="characterBio">Character details will appear here.</p><div class="fact-list" id="characterFacts"></div></div>
+        </section>
+        <button class="new-button" id="newSession" disabled>Begin conversation</button>
+      </aside>
+      <section class="conversation" aria-label="Conversation">
+        <header class="conversation-head"><div><h2 id="conversationTitle">A conversation, not a console</h2><p class="conversation-subtitle" id="conversationSubtitle">Choose a character to begin.</p></div><div class="head-actions"><div class="session-state" aria-live="polite"><span class="health-dot" id="sessionDot"></span><span id="sessionText">Not started</span></div><button class="secondary-button" id="close" disabled>End conversation</button></div></header>
+        <div id="messages" aria-live="polite"></div>
+        <div class="composer-wrap"><div class="composer"><textarea id="input" rows="1" placeholder="Start a conversation…" aria-label="Message" disabled></textarea><button class="send-button" id="send" disabled>Send</button></div><div class="composer-hint"><span>Press Enter to send · Shift+Enter for a new line</span><span>Responses may take a moment to arrive.</span></div></div>
+      </section>
+      <aside class="context-rail" aria-label="Conversation context">
+        <section class="context-card"><p class="eyebrow">Character values</p><div class="pill-list" id="values"><span class="pill">Choose a character</span></div></section>
+        <section class="context-card reflection" id="reflectionCard"><p class="eyebrow">Conversation reflection</p><h3>Memory saved</h3><p id="reflectionText"></p></section>
+        <details class="detail-panel"><summary>Conversation details</summary><div class="detail-content"><dl><div><dt>Session</dt><dd id="sessionId">Not started</dd></div><div><dt>Last interaction</dt><dd id="interactionDetail">No messages yet</dd></div><div><dt>Memory</dt><dd id="memoryDetail">No conversation memory yet</dd></div></dl></div></details>
+      </aside>
+    </main>
+  </div>
+  <script>
+    const $ = id => document.getElementById(id);
+    let sessionId = null, activeCharacter = null, busy = false, lastFailedMessage = null;
+    function text(value) { return String(value || '').replace(/_/g, ' '); }
+    function initials(name) { return String(name || '—').split(/\s+/).filter(Boolean).slice(0, 2).map(part => part[0]).join('').toUpperCase() || '—'; }
+    function titleCase(value) { return text(value).replace(/\b\w/g, letter => letter.toUpperCase()); }
+    async function api(path, options = {}) {
+      const response = await fetch('/api' + path, { headers: { 'Content-Type': 'application/json', ...(options.headers || {}) }, ...options });
+      if (!response.ok) { const body = await response.text(); let detail = ''; try { detail = JSON.parse(body).detail || ''; } catch (_) {} if (response.status === 504) detail = 'The character is taking longer than expected. Please try again.'; if (response.status >= 500 && !detail) detail = 'The character could not respond right now. Please retry.'; throw new Error(detail || `The request could not be completed (HTTP ${response.status}).`); }
+      return response.json();
+    }
+    function setHealth(kind, message) { $('healthDot').className = 'health-dot ' + kind; $('healthText').textContent = message; }
+    function setSessionState(kind, message) { $('sessionDot').className = 'health-dot ' + kind; $('sessionText').textContent = message; }
+    function setBusy(nextBusy, status) { busy = nextBusy; $('send').disabled = nextBusy || !sessionId; $('input').disabled = nextBusy || !sessionId; $('newSession').disabled = nextBusy || !activeCharacter; $('close').disabled = nextBusy || !sessionId; $('character').disabled = nextBusy || Boolean(sessionId); if (status) setSessionState(nextBusy ? '' : 'ready', status); }
+    function clearMessages() { $('messages').replaceChildren(); }
+    function addMessage(message, kind, label) { const node = document.createElement('article'); node.className = 'message ' + kind; if (label) { const heading = document.createElement('span'); heading.className = 'message-label'; heading.textContent = label; node.appendChild(heading); } const body = document.createElement('div'); body.textContent = message; node.appendChild(body); $('messages').appendChild(node); $('messages').scrollTop = $('messages').scrollHeight; return node; }
+    function addNotice(message, isError = false, canRetry = false) { const node = document.createElement('div'); node.className = 'message system' + (isError ? ' error' : ''); const body = document.createElement('span'); body.textContent = message; node.appendChild(body); if (canRetry) { const retry = document.createElement('button'); retry.className = 'retry-button'; retry.textContent = 'Retry'; retry.onclick = () => { if (lastFailedMessage) send(lastFailedMessage); }; node.appendChild(retry); } $('messages').appendChild(node); $('messages').scrollTop = $('messages').scrollHeight; }
+    function showTyping(show) { const existing = $('typing'); if (!show && existing) existing.remove(); if (show && !existing) { const node = document.createElement('div'); node.id = 'typing'; node.className = 'typing'; node.innerHTML = '<span class="typing-dots" aria-hidden="true"><i></i><i></i><i></i></span><span id="typingText"></span>'; $('messages').appendChild(node); $('messages').scrollTop = $('messages').scrollHeight; } if (show) $('typingText').textContent = `${activeCharacter.identity.name} is thinking…`; }
+    function starterQuestions(character) { const name = character.identity.name.split(' ')[0]; return [`What does your work as ${character.identity.occupation.toLowerCase()} involve?`, `What matters most to you, ${name}?`, 'What has been on your mind lately?']; }
+    function showWelcome() { clearMessages(); if (!activeCharacter) return; const node = document.createElement('section'); node.className = 'welcome'; node.innerHTML = `<div class="welcome-orb">${initials(activeCharacter.identity.name)}</div><h3>Meet ${activeCharacter.identity.name}</h3><p>${activeCharacter.biography}</p><div class="starter-list" id="starters"></div>`; $('messages').appendChild(node); const starters = node.querySelector('#starters'); for (const question of starterQuestions(activeCharacter)) { const button = document.createElement('button'); button.className = 'chip'; button.textContent = question; button.onclick = async () => { if (!sessionId) await beginConversation(); await send(question); }; starters.appendChild(button); } $('conversationTitle').textContent = `Talk with ${activeCharacter.identity.name}`; $('conversationSubtitle').textContent = `${activeCharacter.identity.occupation} · ${activeCharacter.identity.faction}`; }
+    function renderCharacter(character) { activeCharacter = character || null; if (!character) return; $('initials').textContent = initials(character.identity.name); $('characterName').textContent = character.identity.name; $('characterRole').textContent = `${character.identity.occupation} · ${character.identity.faction}`; $('characterBio').textContent = character.biography; const facts = [['From', character.identity.birthplace], ['Values', (character.values || []).slice(0, 2).map(titleCase).join(' · ')]]; $('characterFacts').replaceChildren(...facts.map(([label, value]) => { const row = document.createElement('div'); row.className = 'fact'; row.innerHTML = `<span>${label}</span><strong>${value || '—'}</strong>`; return row; })); $('values').replaceChildren(...(character.values || []).map(value => { const pill = document.createElement('span'); pill.className = 'pill'; pill.textContent = titleCase(value); return pill; })); if (!sessionId) showWelcome(); }
+    function updateConversationContext(out) { const interaction = out.interaction || {}; $('interactionDetail').textContent = `${titleCase(interaction.interaction_type || 'conversation')}: ${titleCase(interaction.topic || 'general discussion')}`; const memories = Array.isArray(out.memory_writes) ? out.memory_writes.length : 0; $('memoryDetail').textContent = memories ? `${memories} memory item${memories === 1 ? '' : 's'} saved from this exchange` : 'Conversation is being kept in context'; }
+    async function beginConversation() { if (!activeCharacter || busy || sessionId) return; setBusy(true, 'Opening conversation…'); try { const session = await api('/sessions', { method: 'POST', body: JSON.stringify({ character_id: activeCharacter.id }) }); sessionId = session.id; $('sessionId').textContent = sessionId; $('reflectionCard').classList.remove('visible'); showWelcome(); $('input').placeholder = `Message ${activeCharacter.identity.name.split(' ')[0]}…`; setBusy(false, 'Conversation active'); $('input').focus(); } catch (error) { setBusy(false, 'Could not start'); addNotice(error.message, true); } }
+    async function send(message) { const value = String(message || $('input').value).trim(); if (!value || !sessionId || busy) return; lastFailedMessage = value; $('input').value = ''; addMessage(value, 'user', 'You'); showTyping(true); setBusy(true, `${activeCharacter.identity.name.split(' ')[0]} is thinking…`); try { const out = await api(`/sessions/${sessionId}/chat`, { method: 'POST', body: JSON.stringify({ message: value }) }); showTyping(false); addMessage(out.message, 'character', activeCharacter.identity.name); updateConversationContext(out); lastFailedMessage = null; setBusy(false, 'Conversation active'); } catch (error) { showTyping(false); addNotice(error.message, true, true); setBusy(false, 'Ready to retry'); } }
+    async function endConversation() { if (!sessionId || busy) return; setBusy(true, 'Saving reflection…'); try { const out = await api(`/sessions/${sessionId}/close`, { method: 'POST', body: '{}' }); const summary = out.reflection && out.reflection.summary; if (summary) { $('reflectionText').textContent = summary; $('reflectionCard').classList.add('visible'); addNotice(`Reflection: ${summary}`); } sessionId = null; $('sessionId').textContent = 'Closed'; $('input').placeholder = 'Begin a new conversation to continue.'; setBusy(false, 'Conversation ended'); } catch (error) { setBusy(false, 'Could not end'); addNotice(error.message, true); } }
+    async function loadCharacters() { const characters = await api('/characters'); $('character').replaceChildren(...characters.map(character => { const option = document.createElement('option'); option.value = character.id; option.textContent = character.identity.name; option._character = character; return option; })); renderCharacter(characters[0]); setBusy(false, 'Not started'); }
+    async function checkHealth() { try { await api('/health'); setHealth('ready', 'System ready'); } catch (_) { setHealth('error', 'System unavailable'); } }
+    $('newSession').onclick = beginConversation; $('close').onclick = endConversation; $('send').onclick = () => send(); $('character').onchange = event => renderCharacter(event.target.selectedOptions[0]._character); $('input').addEventListener('keydown', event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); send(); } });
+    Promise.all([loadCharacters(), checkHealth()]).catch(error => { setHealth('error', 'Could not load characters'); $('conversationSubtitle').textContent = error.message; });
+  </script>
 </body>
 </html>

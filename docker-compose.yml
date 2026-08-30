@@ -8,7 +8,8 @@ services:
     ports:
       - "3000:80"
     depends_on:
-      - orchestrator
+      orchestrator:
+        condition: service_healthy
     networks: [cognition]
 
   orchestrator:
@@ -23,10 +24,19 @@ services:
     ports:
       - "8080:8000"
     depends_on:
-      - memory
-      - left-model
-      - right-model
-      - executive-model
+      memory:
+        condition: service_healthy
+      left-model:
+        condition: service_healthy
+      right-model:
+        condition: service_healthy
+      executive-model:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
     networks: [cognition]
 
   memory:
@@ -38,7 +48,41 @@ services:
       CHARACTER_DIR: /characters
     volumes:
       - cognition-data:/data
-      - ./characters:/characters:ro
+      # Profile Studio persists validated primers here. Runtime conversation state
+      # remains in the separate cognition-data volume.
+      - ./characters:/characters
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    networks: [cognition]
+
+  # Ollama is the live local-model provider. Model weights persist in a named volume.
+  ollama:
+    image: ollama/ollama:latest
+    volumes:
+      - ollama-models:/root/.ollama
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 10s
+    networks: [cognition]
+
+  # Pull once before any cognitive worker declares itself ready. Override OLLAMA_MODEL
+  # in .env to select another locally supported instruct model.
+  ollama-init:
+    image: ollama/ollama:latest
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.2:3b}
+    entrypoint: ["/bin/sh", "-c", "ollama pull \"$$OLLAMA_MODEL\""]
+    depends_on:
+      ollama:
+        condition: service_healthy
+    restart: "no"
     networks: [cognition]
 
   left-model:
@@ -47,12 +91,20 @@ services:
       dockerfile: services/cognitive_worker/Dockerfile
     environment:
       COGNITIVE_ROLE: left
-      WORKER_BACKEND: ${LEFT_BACKEND:-mock}
-      MODEL_BASE_URL: ${LEFT_MODEL_BASE_URL:-http://host.docker.internal:11434/v1}
-      MODEL_NAME: ${LEFT_MODEL_NAME:-left-local-model}
+      MODEL_BASE_URL: ${LEFT_MODEL_BASE_URL:-http://ollama:11434/v1}
+      MODEL_NAME: ${LEFT_MODEL_NAME:-${OLLAMA_MODEL:-llama3.2:3b}}
       MODEL_API_KEY: ${LEFT_MODEL_API_KEY:-unused}
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+      MODEL_TIMEOUT_SECONDS: ${LEFT_MODEL_TIMEOUT_SECONDS:-150}
+      MODEL_MAX_TOKENS: ${LEFT_MODEL_MAX_TOKENS:-220}
+      MODEL_OUTPUT_ATTEMPTS: ${LEFT_MODEL_OUTPUT_ATTEMPTS:-2}
+    depends_on:
+      ollama-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
     networks: [cognition]
 
   right-model:
@@ -61,12 +113,20 @@ services:
       dockerfile: services/cognitive_worker/Dockerfile
     environment:
       COGNITIVE_ROLE: right
-      WORKER_BACKEND: ${RIGHT_BACKEND:-mock}
-      MODEL_BASE_URL: ${RIGHT_MODEL_BASE_URL:-http://host.docker.internal:11434/v1}
-      MODEL_NAME: ${RIGHT_MODEL_NAME:-right-local-model}
+      MODEL_BASE_URL: ${RIGHT_MODEL_BASE_URL:-http://ollama:11434/v1}
+      MODEL_NAME: ${RIGHT_MODEL_NAME:-${OLLAMA_MODEL:-llama3.2:3b}}
       MODEL_API_KEY: ${RIGHT_MODEL_API_KEY:-unused}
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+      MODEL_TIMEOUT_SECONDS: ${RIGHT_MODEL_TIMEOUT_SECONDS:-150}
+      MODEL_MAX_TOKENS: ${RIGHT_MODEL_MAX_TOKENS:-200}
+      MODEL_OUTPUT_ATTEMPTS: ${RIGHT_MODEL_OUTPUT_ATTEMPTS:-2}
+    depends_on:
+      ollama-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
     networks: [cognition]
 
   executive-model:
@@ -75,16 +135,25 @@ services:
       dockerfile: services/cognitive_worker/Dockerfile
     environment:
       COGNITIVE_ROLE: executive
-      WORKER_BACKEND: ${EXEC_BACKEND:-mock}
-      MODEL_BASE_URL: ${EXEC_MODEL_BASE_URL:-http://host.docker.internal:11434/v1}
-      MODEL_NAME: ${EXEC_MODEL_NAME:-executive-local-model}
+      MODEL_BASE_URL: ${EXEC_MODEL_BASE_URL:-http://ollama:11434/v1}
+      MODEL_NAME: ${EXEC_MODEL_NAME:-${OLLAMA_MODEL:-llama3.2:3b}}
       MODEL_API_KEY: ${EXEC_MODEL_API_KEY:-unused}
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+      MODEL_TIMEOUT_SECONDS: ${EXEC_MODEL_TIMEOUT_SECONDS:-150}
+      MODEL_MAX_TOKENS: ${EXEC_MODEL_MAX_TOKENS:-260}
+      MODEL_OUTPUT_ATTEMPTS: ${EXEC_MODEL_OUTPUT_ATTEMPTS:-2}
+    depends_on:
+      ollama-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
     networks: [cognition]
 
 volumes:
   cognition-data:
+  ollama-models:
 
 networks:
   cognition:

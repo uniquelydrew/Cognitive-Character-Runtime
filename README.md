@@ -18,12 +18,19 @@ The repository currently implements:
 - Executive arbitration after both hemispheres return.
 - Character primers loaded from YAML.
 - Character switching in a browser UI.
+- A separate Profile Studio for creating, viewing, and editing validated YAML
+  character primers, with live runtime state shown separately.
 - Persistent SQLite event/memory store using WAL mode.
 - Append-only raw interaction history.
 - Explicit self-history of character statements.
 - Detection of repeated questions across interactions.
 - Recognition of several paraphrases as one semantic topic in the bootstrap resolver.
-- Explicit response awareness of repetition (for example, `Northbridge. You asked me that before.`).
+- Repeated-question context supplied explicitly to all three live cognitive roles.
+- A post-lobe executive repeat review that can recognize rephrased repeats from shared
+  analysis subjects or fact anchors, even when the initial topic keys differ.
+- Conversation-level patience plus audited, subject-specific defensiveness, with a
+  deterministic confused/defensive delivery guard when a local model ignores the
+  executive's tone instruction.
 - Post-interaction Executive reflection.
 - Reflection retrieval of earlier interactions on the same resolved topic.
 - Persistent event-to-event `revisits` links.
@@ -34,8 +41,9 @@ The repository currently implements:
 - Belief revision history rather than destructive replacement.
 - Provenance on derived memories.
 - Developer cognition panel exposing Left, Right, Executive, interaction classification, and reflection output.
-- A deterministic mock backend so the whole architecture can be tested without downloading a model.
-- An OpenAI-compatible backend adapter so each cognitive worker can be pointed at a local LLM server.
+- An Ollama local-model service, with an initialization service that pulls the configured model before workers start.
+- OpenAI-compatible JSON-mode model calls with per-role, mode-specific contracts and server-side Pydantic validation.
+- Model-aware worker readiness checks: a worker is healthy only after its configured model is available.
 
 ## Architecture
 
@@ -103,6 +111,11 @@ Left inference           Right inference
 ```
 
 Left and Right run concurrently. Executive runs only after both are available.
+
+Before Executive inference, the orchestrator reviews the completed Left and Right
+artifacts against the bounded recent event stream. It produces a repeat candidate,
+an inherited semantic subject key, and an interaction posture. This lets the lobes
+reason freely while making repeat detection an explicit executive responsibility.
 
 ## Reflection lifecycle
 
@@ -283,10 +296,12 @@ This policy boundary is deterministic infrastructure rather than an LLM instruct
 │       ├── app.py
 │       └── Dockerfile
 ├── tests/
+│   ├── fake_openai_provider.py  # protocol fixture, test-only
 │   ├── test_e2e.py
 │   └── test_policy.py
 ├── ui/
 │   ├── index.html
+│   ├── profiles.html
 │   ├── nginx.conf
 │   └── Dockerfile
 ├── docker-compose.yml
@@ -296,7 +311,7 @@ This policy boundary is deterministic infrastructure rather than an LLM instruct
 
 ## Run with Docker Compose
 
-The default configuration uses deterministic mock cognitive workers. No LLM download is required.
+The default configuration starts a live local [Ollama](https://docs.ollama.com/docker) provider and pulls `llama3.2:3b` into the persistent `ollama-models` volume. The first start downloads model weights and can take several minutes; subsequent starts reuse them. Set `OLLAMA_MODEL` in `.env` before starting to choose another locally supported instruct model.
 
 ```bash
 docker compose up --build
@@ -308,13 +323,19 @@ Then open:
 http://localhost:3000
 ```
 
+Profile Studio is available at:
+
+```text
+http://localhost:3000/profiles.html
+```
+
 The orchestrator API is exposed separately at:
 
 ```text
 http://localhost:8080
 ```
 
-The memory and cognitive-worker ports remain internal to the Docker bridge network.
+The memory, Ollama, and cognitive-worker ports remain internal to the Docker bridge network. A worker reports healthy only after the provider exposes its configured model.
 
 ## Character primers
 
@@ -357,6 +378,18 @@ Adding another YAML file creates another selectable character after the memory s
 
 Existing mutable state is not reset when the primer is reloaded.
 
+## Profile Studio and source of truth
+
+Profile Studio edits the canonical YAML file in `characters/` and immediately
+updates the runtime's design-time character document. It exposes identity,
+traits, cognition, speech, values, inhibitions, goals, biography, source
+defaults, and an advanced complete-document JSON editor.
+
+Conversation-derived mutable state, beliefs, and goals are shown alongside the
+profile for inspection but are deliberately not overwritten by a profile save.
+This keeps an author changing a character's primer from silently erasing an
+ongoing character's accumulated experience.
+
 ## Repeated-question continuity
 
 The bootstrap topic resolver recognizes several common identity questions. For example:
@@ -387,53 +420,42 @@ The orchestrator queries prior interaction history before invoking the cognitive
 
 The repetition itself becomes part of the current cognitive context rather than relying on the language model to notice a distant transcript entry.
 
+The runtime maintains two separate signals:
+
+- **Conversation patience** declines gradually with the current session's turns and
+  active repeat streak; changing subject removes only the active repeat penalty.
+- **Subject defensiveness** is durable mutable state keyed by the resolved semantic
+  subject. It rises only for that subject, cools slowly on a non-repeat return, and
+  is revision-audited with the user event as evidence.
+
+Their intersection selects `normal`, `reclarify`, `confused`, or `defensive` posture.
+The executive receives that posture after both lobe analyses; a small delivery guard
+makes confused and defensive boundaries visible if a lightweight local model ignores
+the requested tone.
+
 The deterministic topic resolver is intentionally temporary. A later milestone should replace it with a hybrid semantic resolver while retaining stable topic IDs.
 
-## Using actual local models
+## Live model providers and output contracts
 
-Each cognitive worker supports `WORKER_BACKEND=openai_compatible` and can target a different OpenAI-compatible inference endpoint.
-
-Environment variables are role-specific in Compose:
+Every cognitive worker calls an OpenAI-compatible `POST /v1/chat/completions` endpoint. Docker Compose defaults to its bundled Ollama service at `http://ollama:11434/v1`, but each role can independently target another provider through these `.env` variables:
 
 ```text
-LEFT_BACKEND
-LEFT_MODEL_BASE_URL
-LEFT_MODEL_NAME
-LEFT_MODEL_API_KEY
-
-RIGHT_BACKEND
-RIGHT_MODEL_BASE_URL
-RIGHT_MODEL_NAME
-RIGHT_MODEL_API_KEY
-
-EXEC_BACKEND
-EXEC_MODEL_BASE_URL
-EXEC_MODEL_NAME
-EXEC_MODEL_API_KEY
+OLLAMA_MODEL
+LEFT_MODEL_BASE_URL    LEFT_MODEL_NAME    LEFT_MODEL_API_KEY    LEFT_MODEL_TIMEOUT_SECONDS    LEFT_MODEL_MAX_TOKENS    LEFT_MODEL_OUTPUT_ATTEMPTS
+RIGHT_MODEL_BASE_URL   RIGHT_MODEL_NAME   RIGHT_MODEL_API_KEY   RIGHT_MODEL_TIMEOUT_SECONDS   RIGHT_MODEL_MAX_TOKENS   RIGHT_MODEL_OUTPUT_ATTEMPTS
+EXEC_MODEL_BASE_URL    EXEC_MODEL_NAME    EXEC_MODEL_API_KEY    EXEC_MODEL_TIMEOUT_SECONDS    EXEC_MODEL_MAX_TOKENS    EXEC_MODEL_OUTPUT_ATTEMPTS
 ```
 
-Example `.env` shape:
+The workers request documented OpenAI-compatible JSON mode and validate the returned JSON before returning it to the orchestrator. The accepted contracts are intentionally different for each task:
 
-```dotenv
-LEFT_BACKEND=openai_compatible
-LEFT_MODEL_BASE_URL=http://host.docker.internal:11434/v1
-LEFT_MODEL_NAME=left-model
-LEFT_MODEL_API_KEY=unused
-
-RIGHT_BACKEND=openai_compatible
-RIGHT_MODEL_BASE_URL=http://host.docker.internal:11434/v1
-RIGHT_MODEL_NAME=right-model
-RIGHT_MODEL_API_KEY=unused
-
-EXEC_BACKEND=openai_compatible
-EXEC_MODEL_BASE_URL=http://host.docker.internal:11434/v1
-EXEC_MODEL_NAME=executive-model
-EXEC_MODEL_API_KEY=unused
+```text
+left / turn             topic, observations, constraints, strategy, confidence
+right / turn            social read, affect, tone, associations
+executive / turn        speech, strategy, typed mutations, memory writes
+executive / reflection  summary, event links, typed mutations
 ```
 
-The adapter sends structured character/context state and requests a JSON object back from the model. No persistent state is kept inside the worker.
-
-For the final local deployment, the inference endpoint can either run in each cognitive container or as a dedicated local inference service behind it. The API contract does not change.
+If a provider is unreachable, the model is missing, or its output violates the contract, the worker returns a controlled error and no derived memory or mutation is written. Workers remain stateless; the memory service remains the sole owner of durable character state.
 
 ## API outline
 
@@ -443,6 +465,10 @@ For the final local deployment, the inference endpoint can either run in each co
 GET  /health
 GET  /characters
 GET  /characters/{character_id}/state
+GET  /profiles
+GET  /profiles/{character_id}
+POST /profiles
+PUT  /profiles/{character_id}
 POST /sessions
 GET  /sessions/{session_id}/events
 POST /sessions/{session_id}/chat
@@ -484,13 +510,14 @@ reflection mutation is policy-validated
 later interactions connect back to earlier topic history
 reflection is idempotent
 closed interactions reject additional chat
+model-provider output is validated against the role contract
 core mutation policy rejects runtime biography changes
 ```
 
 Current result:
 
 ```text
-5 passed
+18 passed
 ```
 
 ## Deliberately deferred
@@ -514,14 +541,13 @@ model fine-tuning
 GPU scheduling
 ```
 
-Those should be added only after testing the three-role cognitive decomposition with real lightweight models.
+The current runtime uses real lightweight local models; the remaining work is about richer retrieval, reasoning, and simulation integration.
 
 ## Next implementation milestones
 
 1. Replace the bootstrap topic normalizer with stable semantic proposition IDs and embedding-assisted retrieval.
-2. Define strict JSON Schemas for each cognitive role rather than accepting arbitrary model JSON.
-3. Add contradiction detection between incoming claims, prior self-statements, beliefs, and canonical facts.
-4. Expand reflection to create causal/support/contradiction/supersession graph edges.
-5. Add typed belief extraction and confidence revision from completed interactions.
-6. Add a world-state/tool boundary so the Executive can propose actions without directly mutating the simulation.
-7. Run heterogeneous 1B-4B local models for Left, Right, and Executive and measure latency, coherence, contradiction rate, and repeat-answer stability against a single-model baseline.
+2. Add contradiction detection between incoming claims, prior self-statements, beliefs, and canonical facts.
+3. Expand reflection to create causal/support/contradiction/supersession graph edges.
+4. Add typed belief extraction and confidence revision from completed interactions.
+5. Add a world-state/tool boundary so the Executive can propose actions without directly mutating the simulation.
+6. Run heterogeneous local models for Left, Right, and Executive and measure latency, coherence, contradiction rate, and repeat-answer stability against a single-model baseline.

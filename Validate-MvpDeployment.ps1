@@ -44,7 +44,7 @@ $script:HttpClient = [System.Net.Http.HttpClient]::new()
 $script:HttpClient.Timeout = [TimeSpan]::FromSeconds($RequestTimeoutSeconds)
 $script:SessionId = $null
 $script:SelectedCharacterId = $null
-$script:WorkerBackends = @{}
+$script:WorkerProviders = @{}
 
 function Add-Check {
     param(
@@ -214,7 +214,7 @@ function Test-ComposeDefinition {
     if ($serviceResult.ExitCode -ne 0) { throw "Unable to enumerate Compose services." }
 
     $services = @($serviceResult.Lines | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-    $expected = @("ui", "orchestrator", "memory", "left-model", "right-model", "executive-model")
+    $expected = @("ui", "orchestrator", "memory", "ollama", "ollama-init", "left-model", "right-model", "executive-model")
     $missing = @($expected | Where-Object { $_ -notin $services })
     if ($missing.Count -gt 0) {
         Add-Check -Name "Compose services" -Status FAIL -Detail "Missing: $($missing -join ', ')"
@@ -240,7 +240,8 @@ function Test-RunningServices {
     if ($runningResult.ExitCode -ne 0) { throw "Unable to query running services." }
 
     $running = @($runningResult.Lines | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-    $expected = @("ui", "orchestrator", "memory", "left-model", "right-model", "executive-model")
+    # ollama-init is intentionally a one-shot container, so it must not be listed as running.
+    $expected = @("ui", "orchestrator", "memory", "ollama", "left-model", "right-model", "executive-model")
     $missing = @($expected | Where-Object { $_ -notin $running })
 
     if ($missing.Count -gt 0) {
@@ -253,29 +254,39 @@ function Test-RunningServices {
         Add-Check -Name "Running services" -Status FAIL -Detail "Not running: $($missing -join ', '). $hint"
         throw "Required containers are not running."
     }
-    Add-Check -Name "Running services" -Status PASS -Detail "All six MVP services are running."
+    Add-Check -Name "Running services" -Status PASS -Detail "All live runtime services are running."
 }
 
-function Get-WorkerBackends {
+function Get-WorkerProviders {
     foreach ($service in @("left-model", "right-model", "executive-model")) {
         $result = Invoke-NativeCapture -FilePath "docker" -Arguments @(
-            "compose", "exec", "-T", $service, "sh", "-lc", 'printf "%s" "$WORKER_BACKEND"'
+            "compose", "exec", "-T", $service, "env"
         )
-        $backend = if ($result.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($result.Output)) {
-            $result.Output.Trim()
+        $backend = if ($result.ExitCode -eq 0) {
+            $baseLine = @($result.Lines | Where-Object { $_ -like "MODEL_BASE_URL=*" } | Select-Object -First 1)
+            $modelLine = @($result.Lines | Where-Object { $_ -like "MODEL_NAME=*" } | Select-Object -First 1)
+            if ($baseLine.Count -eq 1 -and $modelLine.Count -eq 1) {
+                $baseUrl = $baseLine[0].Substring("MODEL_BASE_URL=".Length)
+                $modelName = $modelLine[0].Substring("MODEL_NAME=".Length)
+                if (-not [string]::IsNullOrWhiteSpace($baseUrl) -and -not [string]::IsNullOrWhiteSpace($modelName)) {
+                    "$baseUrl ($modelName)"
+                }
+                else { "unknown" }
+            }
+            else { "unknown" }
         }
         else {
             "unknown"
         }
-        $script:WorkerBackends[$service] = $backend
+        $script:WorkerProviders[$service] = $backend
     }
 
-    $detail = ($script:WorkerBackends.GetEnumerator() | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ", "
-    if (@($script:WorkerBackends.Values | Where-Object { $_ -eq "unknown" }).Count -gt 0) {
-        Add-Check -Name "Worker backends" -Status WARN -Detail $detail
+    $detail = ($script:WorkerProviders.GetEnumerator() | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ", "
+    if (@($script:WorkerProviders.Values | Where-Object { $_ -eq "unknown" }).Count -gt 0) {
+        Add-Check -Name "Worker providers" -Status WARN -Detail $detail
     }
     else {
-        Add-Check -Name "Worker backends" -Status PASS -Detail $detail
+        Add-Check -Name "Worker providers" -Status PASS -Detail $detail
     }
 }
 
@@ -466,7 +477,7 @@ function Write-ValidationReport {
         ui_base_url           = $UiBaseUrl
         selected_character_id = $script:SelectedCharacterId
         validation_session_id = $script:SessionId
-        worker_backends       = $script:WorkerBackends
+        worker_providers      = $script:WorkerProviders
         summary               = [pscustomobject]@{
             pass = $passCount
             warn = $warnCount
@@ -504,7 +515,7 @@ try {
     Test-ComposeDefinition
     Start-MvpIfRequested
     Test-RunningServices
-    Get-WorkerBackends
+    Get-WorkerProviders
     Test-ServiceHealth
     Get-CharactersAndSelectOne
     Test-ExecutionLifecycle

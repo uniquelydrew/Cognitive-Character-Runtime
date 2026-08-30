@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import uuid
 from contextlib import asynccontextmanager, contextmanager
@@ -25,6 +26,7 @@ from services.common import (
 
 DB_PATH = Path(os.getenv("MEMORY_DATABASE", "/data/cognition.db"))
 CHARACTER_DIR = Path(os.getenv("CHARACTER_DIR", "/characters"))
+PROFILE_ID_RE = re.compile(r"^[a-z][a-z0-9_-]{1,63}$")
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
@@ -188,6 +190,64 @@ def load_character_files() -> None:
         upsert_character(char, initialize=True)
 
 
+def profile_path(character_id: str) -> Path:
+    """Return the canonical YAML path, rejecting traversal and unstable IDs."""
+
+    if not PROFILE_ID_RE.fullmatch(character_id):
+        raise HTTPException(
+            422,
+            "Character IDs must start with a lowercase letter and use only lowercase letters, numbers, _ or -.",
+        )
+    return CHARACTER_DIR / f"{character_id}.yaml"
+
+
+def write_character_source(char: CharacterDocument) -> Path:
+    """Atomically persist the validated profile that bootstraps the runtime."""
+
+    path = profile_path(char.id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".yaml.tmp")
+    source = yaml.safe_dump(
+        char.model_dump(mode="json", exclude_none=True),
+        allow_unicode=True,
+        sort_keys=False,
+    )
+    try:
+        temporary.write_text(source, encoding="utf-8")
+        temporary.replace(path)
+    except OSError as exc:
+        raise HTTPException(503, "The canonical profile source could not be saved.") from exc
+    return path
+
+
+def profile_summary(char: CharacterDocument) -> dict[str, Any]:
+    identity = char.identity
+    return {
+        "id": char.id,
+        "name": str(identity.get("name", char.id)),
+        "occupation": str(identity.get("occupation", "")),
+        "faction": str(identity.get("faction", "")),
+        "source_file": f"{char.id}.yaml",
+    }
+
+
+def read_character_source(character_id: str) -> CharacterDocument:
+    """Read the editable canonical document rather than a runtime projection."""
+
+    path = profile_path(character_id)
+    if not path.exists():
+        raise HTTPException(404, "Canonical profile source was not found.")
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        if "biography_file" in raw:
+            bio_path = path.parent / str(raw.pop("biography_file"))
+            if bio_path.exists():
+                raw["biography"] = bio_path.read_text(encoding="utf-8").strip()
+        return CharacterDocument.model_validate(raw)
+    except (OSError, yaml.YAMLError, ValueError) as exc:
+        raise HTTPException(422, "Canonical profile source is not a valid character document.") from exc
+
+
 def upsert_character(char: CharacterDocument, initialize: bool = False) -> None:
     ts = now_iso()
     with db() as conn:
@@ -229,6 +289,62 @@ def list_characters() -> list[CharacterDocument]:
     with db() as conn:
         rows = conn.execute("SELECT document_json FROM characters ORDER BY id").fetchall()
     return [CharacterDocument.model_validate_json(r["document_json"]) for r in rows]
+
+
+@app.get("/profiles")
+def list_profiles() -> list[dict[str, Any]]:
+    """List the editable source-backed profiles for Profile Studio."""
+
+    return [profile_summary(character) for character in list_characters()]
+
+
+@app.get("/profiles/{character_id}")
+def get_profile(character_id: str) -> dict[str, Any]:
+    """Return source document alongside its distinct live runtime state."""
+
+    source = read_character_source(character_id)
+    runtime = get_character(character_id)
+    return {
+        "source": source.model_dump(mode="json"),
+        "source_file": f"{source.id}.yaml",
+        "runtime": {
+            "mutable_state": runtime["mutable_state"],
+            "beliefs": runtime["beliefs"],
+            "goals": runtime["goals"],
+        },
+    }
+
+
+@app.post("/profiles", status_code=201)
+def create_profile(profile: CharacterDocument) -> dict[str, Any]:
+    """Create a validated profile and initialize a matching runtime record."""
+
+    path = profile_path(profile.id)
+    with db() as conn:
+        exists = conn.execute("SELECT 1 FROM characters WHERE id=?", (profile.id,)).fetchone()
+    if exists or path.exists():
+        raise HTTPException(409, "A profile with this ID already exists.")
+    write_character_source(profile)
+    upsert_character(profile, initialize=True)
+    return get_profile(profile.id)
+
+
+@app.put("/profiles/{character_id}")
+def update_profile(character_id: str, profile: CharacterDocument) -> dict[str, Any]:
+    """Update the canonical YAML and immediately refresh its runtime primer."""
+
+    profile_path(character_id)
+    if profile.id != character_id:
+        raise HTTPException(422, "A profile ID cannot be renamed. Create a new profile instead.")
+    with db() as conn:
+        exists = conn.execute("SELECT 1 FROM characters WHERE id=?", (character_id,)).fetchone()
+    if not exists:
+        raise HTTPException(404, "Character not found")
+    write_character_source(profile)
+    # This updates immutable/design-time profile data only. Conversation-derived
+    # mutable state, beliefs, and goals remain separate runtime records.
+    upsert_character(profile)
+    return get_profile(profile.id)
 
 
 @app.get("/characters/{character_id}")
@@ -287,6 +403,9 @@ def get_session(session_id: str) -> dict[str, Any]:
 @app.get("/sessions/{session_id}/events")
 def session_events(session_id: str) -> list[dict[str, Any]]:
     with db() as conn:
+        session = conn.execute("SELECT 1 FROM sessions WHERE id=?", (session_id,)).fetchone()
+        if not session:
+            raise HTTPException(404, "Session not found")
         rows = conn.execute("SELECT * FROM events WHERE session_id=? ORDER BY created_at, rowid", (session_id,)).fetchall()
     return [
         {
@@ -301,9 +420,11 @@ def session_events(session_id: str) -> list[dict[str, Any]]:
 def close_session(session_id: str) -> dict[str, str]:
     ts = now_iso()
     with db() as conn:
-        row = conn.execute("SELECT status FROM sessions WHERE id=?", (session_id,)).fetchone()
+        row = conn.execute("SELECT status, closed_at FROM sessions WHERE id=?", (session_id,)).fetchone()
         if not row:
             raise HTTPException(404, "Session not found")
+        if row["status"] == "closed":
+            return {"id": session_id, "status": "closed", "closed_at": row["closed_at"]}
         conn.execute("UPDATE sessions SET status='closed', closed_at=? WHERE id=?", (ts, session_id))
     return {"id": session_id, "status": "closed", "closed_at": ts}
 
@@ -313,6 +434,19 @@ def add_event(event: EventRecord) -> EventRecord:
     eid = event.id or f"evt_{uuid.uuid4().hex}"
     ts = now_iso()
     with db() as conn:
+        character = conn.execute("SELECT 1 FROM characters WHERE id=?", (event.character_id,)).fetchone()
+        if not character:
+            raise HTTPException(404, "Character not found")
+        if event.session_id:
+            session = conn.execute(
+                "SELECT character_id, status FROM sessions WHERE id=?", (event.session_id,)
+            ).fetchone()
+            if not session:
+                raise HTTPException(404, "Session not found")
+            if session["character_id"] != event.character_id:
+                raise HTTPException(409, "Event character does not match session character")
+            if session["status"] != "open":
+                raise HTTPException(409, "Interaction is already closed")
         conn.execute(
             """
             INSERT INTO events(id, character_id, session_id, event_type, actor, content, topic, metadata_json, created_at)
@@ -379,6 +513,9 @@ def add_memory(memory: MemoryRecord) -> MemoryRecord:
     mid = memory.id or f"mem_{uuid.uuid4().hex}"
     ts = now_iso()
     with db() as conn:
+        character = conn.execute("SELECT 1 FROM characters WHERE id=?", (memory.character_id,)).fetchone()
+        if not character:
+            raise HTTPException(404, "Character not found")
         conn.execute(
             """
             INSERT INTO memories(
@@ -448,6 +585,9 @@ def apply_mutations(character_id: str, batch: MutationBatch) -> list[ValidatedMu
     results: list[ValidatedMutation] = []
     ts = now_iso()
     with db() as conn:
+        character = conn.execute("SELECT 1 FROM characters WHERE id=?", (character_id,)).fetchone()
+        if not character:
+            raise HTTPException(404, "Character not found")
         for proposal in batch.proposals:
             checked = validate_proposal(proposal)
             results.append(checked)

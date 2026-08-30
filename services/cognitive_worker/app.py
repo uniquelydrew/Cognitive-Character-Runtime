@@ -2,246 +2,215 @@ from __future__ import annotations
 
 import json
 import os
-import re
 from typing import Any
 
 import httpx
 from fastapi import FastAPI, HTTPException
+from pydantic import ValidationError
 
-from services.common import CognitiveRequest, CognitiveResponse
+from services.common import CognitiveRequest, CognitiveResponse, ModelOutput, output_model_for
 
-ROLE = os.getenv("COGNITIVE_ROLE", "left").lower()
-BACKEND = os.getenv("WORKER_BACKEND", "mock").lower()
-MODEL_BASE_URL = os.getenv("MODEL_BASE_URL", "http://localhost:11434/v1").rstrip("/")
-MODEL_NAME = os.getenv("MODEL_NAME", "local-model")
+ROLE = os.getenv("COGNITIVE_ROLE", "").lower()
+MODEL_BASE_URL = os.getenv("MODEL_BASE_URL", "http://ollama:11434/v1").rstrip("/")
+MODEL_NAME = os.getenv("MODEL_NAME", "llama3.2:3b")
 MODEL_API_KEY = os.getenv("MODEL_API_KEY", "unused")
+MODEL_TIMEOUT_SECONDS = float(os.getenv("MODEL_TIMEOUT_SECONDS", "150"))
+MODEL_MAX_TOKENS = int(os.getenv("MODEL_MAX_TOKENS", "240"))
+MODEL_OUTPUT_ATTEMPTS = int(os.getenv("MODEL_OUTPUT_ATTEMPTS", "2"))
 
-app = FastAPI(title=f"Cognitive Worker: {ROLE}", version="0.1.0")
+if ROLE not in {"left", "right", "executive"}:
+    raise RuntimeError("COGNITIVE_ROLE must be one of: left, right, executive")
+if MODEL_TIMEOUT_SECONDS <= 0:
+    raise RuntimeError("MODEL_TIMEOUT_SECONDS must be positive")
+if MODEL_MAX_TOKENS <= 0:
+    raise RuntimeError("MODEL_MAX_TOKENS must be positive")
+if MODEL_OUTPUT_ATTEMPTS <= 0:
+    raise RuntimeError("MODEL_OUTPUT_ATTEMPTS must be positive")
 
-
-def _name(req: CognitiveRequest) -> str:
-    return str(req.character.identity.get("name", req.character.id))
-
-
-def _topic_key(text: str) -> str:
-    tokens = re.findall(r"[a-z0-9']+", text.lower())
-    stop = {
-        "a", "an", "the", "is", "are", "was", "were", "do", "did", "does", "you",
-        "your", "yours", "i", "me", "my", "what", "where", "when", "who", "why",
-        "how", "again", "tell", "said", "say", "about", "to", "of", "in", "on",
-    }
-    kept = [t for t in tokens if t not in stop]
-    return ".".join(kept[:8]) or "general"
+app = FastAPI(title=f"Cognitive Worker: {ROLE}", version="0.2.0")
 
 
-def _mock_left(req: CognitiveRequest) -> dict[str, Any]:
-    classification = req.context.get("interaction", {})
-    relevant = req.context.get("memories", [])
-    facts = [
-        m for m in relevant
-        if m.get("epistemic_type") in {"fact", "observation", "self_statement", "belief"}
-    ]
-    return {
-        "topic": classification.get("topic") or _topic_key(req.user_input),
-        "observations": [m.get("content") for m in facts[:5]],
-        "consistency_constraints": [
-            m.get("content") for m in relevant if m.get("kind") == "self_history"
-        ][:5],
-        "recommended_strategy": "answer_consistently" if classification.get("prior_answer") else "answer_from_known_state",
-        "confidence": 0.86 if facts else 0.55,
-    }
-
-
-def _mock_right(req: CognitiveRequest) -> dict[str, Any]:
-    classification = req.context.get("interaction", {})
-    traits = req.character.traits
-    irritability = float(traits.get("irritable", 0.2))
-    patience = float(traits.get("patient", 0.5))
-    repeat_count = int(classification.get("times_asked", 0))
-    annoyance = min(1.0, max(0.0, irritability * repeat_count - patience * 0.25))
-    return {
-        "social_read": "repetition_noticed" if repeat_count else "ordinary_exchange",
-        "affect": {
-            "annoyance": round(annoyance, 3),
-            "curiosity": 0.35 if repeat_count else 0.5,
-        },
-        "recommended_tone": "pointed" if annoyance > 0.55 else "patient",
-        "associations": [m.get("content") for m in req.context.get("memories", [])[:4]],
-    }
-
-
-def _canonical_answer(req: CognitiveRequest) -> str | None:
-    q = req.user_input.lower()
-    identity = req.character.identity
-    mappings = {
-        "born": "birthplace",
-        "birthplace": "birthplace",
-        "name": "name",
-        "occupation": "occupation",
-        "job": "occupation",
-    }
-    for needle, key in mappings.items():
-        if needle in q and key in identity:
-            return str(identity[key])
-    return None
-
-
-def _mock_executive_turn(req: CognitiveRequest) -> dict[str, Any]:
-    interaction = req.context.get("interaction", {})
-    prior_answer = interaction.get("prior_answer")
-    answer = prior_answer or _canonical_answer(req)
-    name = _name(req)
-    repeated = interaction.get("interaction_type") in {"repeated_question", "paraphrase"}
-    count = int(interaction.get("times_asked", 0))
-    right = req.right_result or {}
-    annoyance = float(right.get("affect", {}).get("annoyance", 0.0))
-
-    if answer:
-        if repeated and annoyance > 0.55:
-            speech = f"{answer}. You've asked me that {max(2, count)} times now."
-        elif repeated:
-            speech = f"{answer}. You asked me that before."
-        else:
-            speech = answer
-    else:
-        biography = req.character.biography.strip()
-        if biography:
-            speech = f"From what I know of myself: {biography.splitlines()[0]}"
-        else:
-            speech = f"I'm {name}. I don't have enough established information to answer that without inventing it."
-
-    topic = interaction.get("topic") or _topic_key(req.user_input)
-    return {
-        "goal": "maintain_continuity",
-        "strategy": "reuse_prior_commitment" if prior_answer else "answer_from_character_state",
-        "speech": speech,
-        "topic": topic,
-        "mutations": [],
-        "memory_writes": [
-            {
-                "kind": "self_history",
-                "topic": topic,
-                "content": speech,
-                "epistemic_type": "self_statement",
-                "confidence": 1.0,
-                "salience": 0.65,
-            }
-        ],
-    }
-
-
-def _mock_reflection(req: CognitiveRequest) -> dict[str, Any]:
-    transcript = req.transcript
-    source_ids = [str(t.get("event_id")) for t in transcript if t.get("event_id")]
-    user_turns = [t for t in transcript if t.get("actor") == "user"]
-    assistant_turns = [t for t in transcript if t.get("actor") == "character"]
-    related_history = req.context.get("related_history", {})
-    summary = (
-        f"Interaction contained {len(user_turns)} user turns and {len(assistant_turns)} character turns."
-    )
-    proposals: list[dict[str, Any]] = []
-    if source_ids:
-        proposals.append({
-            "operation": "add_memory",
-            "target": "interaction_summary",
-            "value": summary,
-            "evidence": source_ids,
-            "confidence": 1.0,
-            "epistemic_type": "observation",
-            "reason": "Consolidate completed interaction without rewriting source events.",
-        })
-
-    links: list[dict[str, Any]] = []
-    current_by_topic: dict[str, list[str]] = {}
-    for event in transcript:
-        topic = event.get("topic")
-        event_id = event.get("event_id")
-        if topic and event_id:
-            current_by_topic.setdefault(str(topic), []).append(str(event_id))
-
-    for topic, prior_events in related_history.items():
-        current_ids = current_by_topic.get(topic, [])
-        if not current_ids or not prior_events:
-            continue
-        prior_id = str(prior_events[-1]["id"])
-        current_id = current_ids[0]
-        link = {"from": prior_id, "to": current_id, "relationship": "revisits"}
-        links.append(link)
-        proposals.append({
-            "operation": "link_events",
-            "target": topic,
-            "value": link,
-            "evidence": [prior_id, current_id],
-            "confidence": 1.0,
-            "epistemic_type": "observation",
-            "reason": "Connect this interaction to earlier history on the same resolved topic.",
-        })
-
-    return {
-        "summary": summary,
-        "related_event_ids": source_ids,
-        "mutations": proposals,
-        "links": links,
-    }
-
-
-def _system_prompt() -> str:
-    if ROLE == "left":
-        return (
+def _system_prompt(mode: str, output_model: type[ModelOutput], *, corrective_retry: bool = False) -> str:
+    role_instructions = {
+        "left": (
             "You are the analytic hemisphere of a persistent fictional character. "
-            "Return only JSON. Focus on facts, consistency, causal reasoning, constraints, and plans. "
-            "Never invent canonical facts. Treat supplied memories according to their epistemic type."
-        )
-    if ROLE == "right":
-        return (
-            "You are the associative/social hemisphere of a persistent fictional character. "
-            "Return only JSON. Focus on affect, social interpretation, associations, subtext, and tone. "
-            "Do not mutate memory or canonical facts."
-        )
+            "Identify relevant established facts, consistency constraints, causal implications, and a response strategy. "
+            "Do not invent canonical facts or propose mutations."
+        ),
+        "right": (
+            "You are the associative and social hemisphere of a persistent fictional character. "
+            "Assess affect, tone, subtext, associations, and social consequences. "
+            "Do not invent canonical facts or propose mutations."
+        ),
+        "executive": (
+            "You are the executive function of a persistent fictional character. "
+            "Arbitrate the supplied left and right analyses while maintaining continuity. "
+            "Before speaking, inspect context.executive_repeat_review, which is prepared after both "
+            "hemispheres finish. Treat semantic_repeat_candidate as a meaningful rephrased-repeat "
+            "signal even when the wording differs. Follow context.conversation_dynamics.response_posture: "
+            "normal means answer neutrally; reclarify means restate or clarify without escalation; "
+            "confused means express sincere, non-accusatory confusion; defensive means set a polite, "
+            "proportionate boundary. This is a tone constraint, not permission to change facts. "
+            "Use only supplied character data and memories as established facts. "
+            "Never rewrite raw history or immutable core biography. Any state change must be a typed, "
+            "evidence-backed mutation proposal."
+        ),
+    }
+    reflection = (
+        " This is reflection mode: summarize the completed interaction and propose only provenance-backed "
+        "derived memories, event links, or mutable revisions."
+        if mode == "reflection"
+        else " This is turn mode: produce the character's next spoken response."
+    )
+    concise_output = (
+        " Keep all text concise. Do not repeat a value. For analytic lists, use at most three short items."
+        if ROLE in {"left", "right"}
+        else " Keep the response concise and do not repeat a value."
+    )
+    correction = (
+        " This is a corrective retry: the previous response was incomplete. Return the minimal valid JSON object now."
+        if corrective_retry
+        else ""
+    )
     return (
-        "You are the executive function of a persistent fictional character. Return only JSON. "
-        "Resolve analytic and associative recommendations, maintain self-continuity, and propose typed mutations. "
-        "Never silently rewrite raw history or immutable core biography. In reflection mode, connect events and "
-        "propose evidence-backed changes while preserving provenance."
+        f"{role_instructions[ROLE]}{reflection}{concise_output}{correction} "
+        "Return one JSON object only: no markdown, no explanation, and no additional keys. "
+        "Every key in this exact shape is required. Use empty arrays when there are no actions to propose. "
+        f"Exact output shape: {_output_example(output_model)}"
     )
 
 
-async def _openai_compatible(req: CognitiveRequest) -> dict[str, Any]:
+def _output_example(output_model: type[ModelOutput]) -> str:
+    """Compact examples are more reliable for small local models than a full JSON Schema."""
+
+    examples = {
+        "LeftAnalysis": {
+            "topic": "stable topic identifier",
+            "observations": ["established observation"],
+            "consistency_constraints": ["constraint to preserve"],
+            "recommended_strategy": "brief strategy",
+            "confidence": 0.8,
+        },
+        "RightAnalysis": {
+            "social_read": "social interpretation",
+            "affect": {"curiosity": 0.4, "annoyance": 0.1},
+            "recommended_tone": "patient",
+            "associations": ["relevant association"],
+        },
+        "ExecutiveTurn": {
+            "goal": "maintain continuity",
+            "strategy": "answer using established character context",
+            "speech": "The character's spoken response as a plain string.",
+            "topic": "stable topic identifier",
+            "mutations": [],
+            "memory_writes": [],
+        },
+        "ExecutiveReflection": {
+            "summary": "brief interaction summary",
+            "related_event_ids": ["evt_source"],
+            "mutations": [],
+            "links": [],
+        },
+    }
+    return json.dumps(examples[output_model.__name__], separators=(",", ":"))
+
+
+def _json_response_format() -> dict[str, str]:
+    """The documented OpenAI-compatible JSON mode supported by Ollama."""
+
+    return {"type": "json_object"}
+
+
+def _model_headers() -> dict[str, str]:
+    return {"Authorization": f"Bearer {MODEL_API_KEY}"} if MODEL_API_KEY else {}
+
+
+async def _request_completion(
+    req: CognitiveRequest,
+    output_model: type[ModelOutput],
+    *,
+    corrective_retry: bool,
+) -> str:
     payload = {
         "model": MODEL_NAME,
         "messages": [
-            {"role": "system", "content": _system_prompt()},
+            {
+                "role": "system",
+                "content": _system_prompt(req.mode, output_model, corrective_retry=corrective_retry),
+            },
             {"role": "user", "content": req.model_dump_json()},
         ],
-        "temperature": 0.1 if ROLE in {"left", "executive"} else 0.65,
-        "response_format": {"type": "json_object"},
+        "temperature": 0.15 if ROLE in {"left", "executive"} else 0.55,
+        # Every worker returns a small structured artifact. Bounding output avoids a
+        # queued local-model request consuming the entire orchestration time budget.
+        "max_tokens": MODEL_MAX_TOKENS,
+        "response_format": _json_response_format(),
     }
-    headers = {"Authorization": f"Bearer {MODEL_API_KEY}"}
-    async with httpx.AsyncClient(timeout=120) as client:
-        r = await client.post(f"{MODEL_BASE_URL}/chat/completions", json=payload, headers=headers)
-        r.raise_for_status()
-        content = r.json()["choices"][0]["message"]["content"]
     try:
-        return json.loads(content)
-    except json.JSONDecodeError as exc:
-        raise HTTPException(status_code=502, detail=f"Model returned invalid JSON: {exc}") from exc
+        async with httpx.AsyncClient(timeout=httpx.Timeout(MODEL_TIMEOUT_SECONDS, connect=10)) as client:
+            response = await client.post(
+                f"{MODEL_BASE_URL}/chat/completions",
+                json=payload,
+                headers=_model_headers(),
+            )
+            response.raise_for_status()
+            body = response.json()
+            content = body["choices"][0]["message"]["content"]
+    except httpx.TimeoutException as exc:
+        raise HTTPException(
+            status_code=504,
+            detail=f"The {ROLE} model did not respond within {MODEL_TIMEOUT_SECONDS:g} seconds. Please retry.",
+        ) from exc
+    except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail=f"Model provider request failed: {exc}") from exc
+
+    if not isinstance(content, str):
+        raise HTTPException(status_code=502, detail="Model provider returned a non-text completion.")
+    return content
+
+
+async def _request_model(req: CognitiveRequest, output_model: type[ModelOutput]) -> ModelOutput:
+    """Validate live output, giving a small local model one concise repair attempt."""
+
+    for attempt in range(MODEL_OUTPUT_ATTEMPTS):
+        content = await _request_completion(req, output_model, corrective_retry=attempt > 0)
+        try:
+            return output_model.model_validate_json(content)
+        except ValidationError:
+            if attempt + 1 < MODEL_OUTPUT_ATTEMPTS:
+                continue
+    raise HTTPException(
+        status_code=502,
+        detail=(
+            f"The {ROLE} model returned an incomplete response after "
+            f"{MODEL_OUTPUT_ATTEMPTS} attempts. Please retry."
+        ),
+    )
 
 
 @app.get("/health")
-def health() -> dict[str, str]:
-    return {"status": "ok", "role": ROLE, "backend": BACKEND, "model": MODEL_NAME}
+async def health() -> dict[str, str]:
+    """Readiness includes the configured live model provider and model registration."""
+
+    try:
+        async with httpx.AsyncClient(timeout=min(MODEL_TIMEOUT_SECONDS, 10)) as client:
+            response = await client.get(f"{MODEL_BASE_URL}/models", headers=_model_headers())
+            response.raise_for_status()
+            models = response.json().get("data", [])
+    except (httpx.HTTPError, ValueError, AttributeError) as exc:
+        raise HTTPException(status_code=503, detail=f"Model provider is unavailable: {exc}") from exc
+
+    available = {str(model.get("id")) for model in models if isinstance(model, dict)}
+    if MODEL_NAME not in available:
+        raise HTTPException(status_code=503, detail=f"Configured model is not available: {MODEL_NAME}")
+    return {"status": "ready", "role": ROLE, "provider": MODEL_BASE_URL, "model": MODEL_NAME}
 
 
 @app.post("/infer", response_model=CognitiveResponse)
 async def infer(req: CognitiveRequest) -> CognitiveResponse:
-    if BACKEND == "openai_compatible":
-        result = await _openai_compatible(req)
-    elif ROLE == "left":
-        result = _mock_left(req)
-    elif ROLE == "right":
-        result = _mock_right(req)
-    elif ROLE == "executive" and req.mode == "reflection":
-        result = _mock_reflection(req)
-    else:
-        result = _mock_executive_turn(req)
-    return CognitiveResponse(role=ROLE, result=result)
+    try:
+        output_model = output_model_for(ROLE, req.mode)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    result = await _request_model(req, output_model)
+    return CognitiveResponse(role=ROLE, result=result.model_dump(mode="json"))

@@ -36,7 +36,7 @@ def free_port() -> int:
 
 @pytest.mark.integration
 def test_character_continuity_and_reflection(tmp_path: Path):
-    ports = {k: free_port() for k in ["memory", "left", "right", "exec", "orch"]}
+    ports = {k: free_port() for k in ["memory", "provider", "left", "right", "exec", "orch"]}
     processes: list[subprocess.Popen] = []
 
     def launch(app: str, port: int, extra_env: dict[str, str]) -> subprocess.Popen:
@@ -65,11 +65,18 @@ def test_character_continuity_and_reflection(tmp_path: Path):
         )
         wait_for(f"http://127.0.0.1:{ports['memory']}/health")
 
+        launch("tests.fake_openai_provider:app", ports["provider"], {})
+        wait_for(f"http://127.0.0.1:{ports['provider']}/v1/models")
+
         for role, key in [("left", "left"), ("right", "right"), ("executive", "exec")]:
             launch(
                 "services.cognitive_worker.app:app",
                 ports[key],
-                {"COGNITIVE_ROLE": role, "WORKER_BACKEND": "mock"},
+                {
+                    "COGNITIVE_ROLE": role,
+                    "MODEL_BASE_URL": f"http://127.0.0.1:{ports['provider']}/v1",
+                    "MODEL_NAME": "test-model",
+                },
             )
             wait_for(f"http://127.0.0.1:{ports[key]}/health")
 
