@@ -5,11 +5,21 @@ services:
     build:
       context: .
       dockerfile: ui/Dockerfile
+    # This is a local desktop runtime. Do not publish the management UI on the
+    # LAN by default; an authenticated reverse proxy is required for any remote
+    # deployment.
     ports:
-      - "3000:80"
+      - "127.0.0.1:3000:8080"
+    environment:
+      API_AUTH_TOKEN: ${API_AUTH_TOKEN:?Set API_AUTH_TOKEN to a long random value in .env before starting the stack.}
     depends_on:
       orchestrator:
         condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
     networks: [cognition]
 
   orchestrator:
@@ -17,12 +27,23 @@ services:
       context: .
       dockerfile: services/orchestrator/Dockerfile
     environment:
+      API_AUTH_TOKEN: ${API_AUTH_TOKEN:?Set API_AUTH_TOKEN to a long random value in .env before starting the stack.}
       MEMORY_URL: http://memory:8000
       LEFT_URL: http://left-model:8000
       RIGHT_URL: http://right-model:8000
       EXEC_URL: http://executive-model:8000
+      WORKER_REQUEST_TIMEOUT_SECONDS: ${WORKER_REQUEST_TIMEOUT_SECONDS:-90}
+      TURN_TIMEOUT_SECONDS: ${TURN_TIMEOUT_SECONDS:-240}
+      SESSION_QUEUE_TIMEOUT_SECONDS: ${SESSION_QUEUE_TIMEOUT_SECONDS:-15}
+      MAX_CONCURRENT_TURNS: ${MAX_CONCURRENT_TURNS:-2}
+      ENABLE_DEBUG_API: ${ENABLE_DEBUG_API:-false}
     ports:
-      - "8080:8000"
+      - "127.0.0.1:8080:8000"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
     depends_on:
       memory:
         condition: service_healthy
@@ -46,11 +67,20 @@ services:
     environment:
       MEMORY_DATABASE: /data/cognition.db
       CHARACTER_DIR: /characters
+      KNOWLEDGE_DIR: /knowledge
     volumes:
       - cognition-data:/data
       # Profile Studio persists validated primers here. Runtime conversation state
       # remains in the separate cognition-data volume.
       - ./characters:/characters
+      # General knowledge is a separate, source-controlled corpus. The runtime
+      # can read it but cannot rewrite it from conversation or model output.
+      - ./knowledge:/knowledge:ro
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 5s
@@ -60,7 +90,7 @@ services:
 
   # Ollama is the live local-model provider. Model weights persist in a named volume.
   ollama:
-    image: ollama/ollama:latest
+    image: ollama/ollama@sha256:020e4134285e2ef4d8fd801234176de3b4faadc992a3eb06c8e66a2f9d4c4ba2
     volumes:
       - ollama-models:/root/.ollama
     healthcheck:
@@ -74,7 +104,7 @@ services:
   # Pull once before any cognitive worker declares itself ready. Override OLLAMA_MODEL
   # in .env to select another locally supported instruct model.
   ollama-init:
-    image: ollama/ollama:latest
+    image: ollama/ollama@sha256:020e4134285e2ef4d8fd801234176de3b4faadc992a3eb06c8e66a2f9d4c4ba2
     environment:
       OLLAMA_HOST: http://ollama:11434
       OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.2:3b}
@@ -94,12 +124,17 @@ services:
       MODEL_BASE_URL: ${LEFT_MODEL_BASE_URL:-http://ollama:11434/v1}
       MODEL_NAME: ${LEFT_MODEL_NAME:-${OLLAMA_MODEL:-llama3.2:3b}}
       MODEL_API_KEY: ${LEFT_MODEL_API_KEY:-unused}
-      MODEL_TIMEOUT_SECONDS: ${LEFT_MODEL_TIMEOUT_SECONDS:-150}
+      MODEL_TIMEOUT_SECONDS: ${LEFT_MODEL_TIMEOUT_SECONDS:-40}
       MODEL_MAX_TOKENS: ${LEFT_MODEL_MAX_TOKENS:-160}
       MODEL_OUTPUT_ATTEMPTS: ${LEFT_MODEL_OUTPUT_ATTEMPTS:-2}
     depends_on:
       ollama-init:
         condition: service_completed_successfully
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 10s
@@ -116,12 +151,17 @@ services:
       MODEL_BASE_URL: ${RIGHT_MODEL_BASE_URL:-http://ollama:11434/v1}
       MODEL_NAME: ${RIGHT_MODEL_NAME:-${OLLAMA_MODEL:-llama3.2:3b}}
       MODEL_API_KEY: ${RIGHT_MODEL_API_KEY:-unused}
-      MODEL_TIMEOUT_SECONDS: ${RIGHT_MODEL_TIMEOUT_SECONDS:-150}
+      MODEL_TIMEOUT_SECONDS: ${RIGHT_MODEL_TIMEOUT_SECONDS:-40}
       MODEL_MAX_TOKENS: ${RIGHT_MODEL_MAX_TOKENS:-160}
       MODEL_OUTPUT_ATTEMPTS: ${RIGHT_MODEL_OUTPUT_ATTEMPTS:-2}
     depends_on:
       ollama-init:
         condition: service_completed_successfully
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 10s
@@ -138,12 +178,22 @@ services:
       MODEL_BASE_URL: ${EXEC_MODEL_BASE_URL:-http://ollama:11434/v1}
       MODEL_NAME: ${EXEC_MODEL_NAME:-${OLLAMA_MODEL:-llama3.2:3b}}
       MODEL_API_KEY: ${EXEC_MODEL_API_KEY:-unused}
-      MODEL_TIMEOUT_SECONDS: ${EXEC_MODEL_TIMEOUT_SECONDS:-150}
+      MODEL_TIMEOUT_SECONDS: ${EXEC_MODEL_TIMEOUT_SECONDS:-40}
       MODEL_MAX_TOKENS: ${EXEC_MODEL_MAX_TOKENS:-220}
+      # Repeated questions receive a separate Executive-only intent assessment
+      # followed by a speaking pass, while immediate exact repeats still skip
+      # the two lobe calls.
+      MODEL_REPEAT_MAX_TOKENS: ${EXEC_REPEAT_MAX_TOKENS:-360}
+      MODEL_REPEAT_TEMPERATURE: ${EXEC_REPEAT_TEMPERATURE:-0.32}
       MODEL_OUTPUT_ATTEMPTS: ${EXEC_MODEL_OUTPUT_ATTEMPTS:-2}
     depends_on:
       ollama-init:
         condition: service_completed_successfully
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 10s

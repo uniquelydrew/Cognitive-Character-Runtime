@@ -18,12 +18,16 @@ The repository currently implements:
 - Executive arbitration after both hemispheres return.
 - Character primers loaded from YAML.
 - Character switching in a browser UI.
-- A separate Profile Studio for creating, viewing, and editing validated YAML
-  character primers, with live runtime state shown separately.
+- A separate Profile Studio for creating, viewing, editing, importing, and
+  exporting validated YAML character snapshots.
+- A profile-side snapshot comparison view that reports source and runtime diffs
+  before a restore.
+- A separate source-controlled, hierarchical general-knowledge corpus with
+  label-indexed retrieval and character-derived access subsets.
 - Persistent SQLite event/memory store using WAL mode.
 - Append-only raw interaction history.
 - Explicit self-history of character statements.
-- Detection of repeated questions across interactions.
+- Detection of repeated questions within the active interaction.
 - Recognition of several paraphrases as one semantic topic in the bootstrap resolver.
 - Repeated-question context supplied explicitly to all three live cognitive roles.
 - A post-lobe executive repeat review that can recognize rephrased repeats from shared
@@ -44,6 +48,8 @@ The repository currently implements:
 - An Ollama local-model service, with an initialization service that pulls the configured model before workers start.
 - OpenAI-compatible JSON-mode model calls with per-role, mode-specific contracts and server-side Pydantic validation.
 - Model-aware worker readiness checks: a worker is healthy only after its configured model is available.
+- Loopback-only public ports, an authenticated API proxy, no permissive CORS,
+  disabled-by-default debug routes, and bounded request/turn execution.
 
 ## Architecture
 
@@ -111,6 +117,16 @@ Left inference           Right inference
 ```
 
 Left and Right run concurrently. Executive runs only after both are available.
+
+The orchestrator admits at most `MAX_CONCURRENT_TURNS` full live turns at once
+(default `2`). This protects local model capacity: when saturated, it returns a
+retryable `429` instead of allowing browser retries or multiple tabs to create
+an unbounded model queue.
+
+After inference succeeds, the character reply, sourced memory writes, and
+policy-checked mutations are committed as one memory-service transaction. The
+initial user event remains durable for idempotent retry recovery; a failed
+derived write cannot leave a partial character reply or partial conclusions.
 
 Before Executive inference, the orchestrator reviews the completed Left and Right
 artifacts against the bounded recent event stream. It produces a repeat candidate,
@@ -313,6 +329,17 @@ This policy boundary is deterministic infrastructure rather than an LLM instruct
 
 The default configuration starts a live local [Ollama](https://docs.ollama.com/docker) provider and pulls `llama3.2:3b` into the persistent `ollama-models` volume. The first start downloads model weights and can take several minutes; subsequent starts reuse them. Set `OLLAMA_MODEL` in `.env` before starting to choose another locally supported instruct model.
 
+Before the first start, create a private `.env` and set a cryptographically
+random `API_AUTH_TOKEN`; `.env.example` includes a one-line Python generator.
+The stack deliberately refuses to start without it.
+
+On Windows, the included initializer creates the private file and never prints
+the token:
+
+```powershell
+.\Initialize-LocalRuntime.ps1
+```
+
 ```bash
 docker compose up --build
 ```
@@ -334,6 +361,11 @@ The orchestrator API is exposed separately at:
 ```text
 http://localhost:8080
 ```
+
+It is loopback-only and requires `X-API-Key: <API_AUTH_TOKEN>` for every route
+except `/health`. The browser UI does not receive the secret: nginx injects it
+only while proxying same-origin `/api` requests. Do not expose either port on a
+network without an additional authenticated reverse proxy and TLS.
 
 The memory, Ollama, and cognitive-worker ports remain internal to the Docker bridge network. A worker reports healthy only after the provider exposes its configured model.
 
@@ -390,6 +422,48 @@ profile for inspection but are deliberately not overwritten by a profile save.
 This keeps an author changing a character's primer from silently erasing an
 ongoing character's accumulated experience.
 
+Profile Studio can also download a `*.snapshot.yaml` export. Unlike a primer
+alone, it contains the canonical source plus all durable runtime material:
+mutable state, versioned beliefs, goals, derived memories, sessions/events,
+event links, and mutation/belief provenance. Export before a conversation and
+again afterward, then use **Compare YAML** to see the character's accumulated
+conclusions directly. Import
+accepts either a source-only character YAML (which updates or creates the primer)
+or a full snapshot YAML (which restores the captured runtime for that profile ID).
+Because a snapshot restore replaces the profile's runtime history, the UI asks for
+confirmation before uploading it.
+
+Full snapshot uploads are size- and parser-complexity-bounded, schema-validated
+before any write, and reference-checked. Source YAML is staged and atomically
+swapped immediately before the SQLite commit; a failed import compensates both
+stores rather than leaving a mixed primer/runtime state.
+
+## General knowledge and classification hierarchy
+
+General knowledge is not stored as a recent event or a character memory. It is a
+source-controlled corpus under `knowledge/`, organized by classification nodes
+and indexed by those labels. A node may inherit from one or more parent nodes;
+the loader rejects unknown parents and cycles.
+
+Each knowledge record has retrieval labels plus an access rule:
+
+```yaml
+id: northbridge.port_staff_manifest_triage
+labels: [community.port_staff, domain.recordkeeping]
+access:
+  require_all: [community.port_staff]
+assertions:
+  - Staff reconcile manifests with berth logs.
+```
+
+At turn time, the runtime resolves only taxonomy aliases in the user’s message,
+uses the label index to select candidates, derives a character’s label closure
+from their birthplace, faction, occupation, and explicit `knowledge_labels`, and
+then applies `require_all` / `require_any`. Only the allowed subset is included
+in cognitive-worker context. The model never receives denied records or the full
+corpus. Recent events and memories can affect interpretation, but cannot mutate
+or grant this general-knowledge source.
+
 ## Repeated-question continuity
 
 The bootstrap topic resolver recognizes several common identity questions. For example:
@@ -435,15 +509,19 @@ before durable subject defensiveness changes.
 
 For an immediate exact repeat in the same session that already received a character
 answer, the runtime reuses the stored compact Left/Right artifacts and invokes only
-the Executive to reframe the answer. The Executive receives the prior speech and
-must choose a distinct established facet, a focused clarification question, or a
-proportionate boundary. A close echo receives one Executive-only correction attempt;
-if that still echoes, a neutral clarification fallback prevents the user from seeing
-the same answer again. Rephrases still use fresh lobe analysis so the Executive can
-detect non-exact semantic repetition safely. `cognition.timing_ms` reports an
-`executive_reframe_retry` only when that correction path is used.
+the Executive for two linked tasks: it first produces a compact, fallible assessment
+of plausible repeat intent (for example, seeking a different angle, checking
+consistency, or not understanding), then it produces the spoken response from that
+assessment. The Executive has a separate, larger repeat token budget for both calls.
+If a speaking attempt merely echoes the prior answer, it gets one Executive revision
+using the same assessment. Only after both attempts fail does an intent-specific
+fallback prevent another visible echo; it is not a single canned clarification phrase.
+Rephrases still use fresh lobe analysis so the Executive can detect non-exact semantic
+repetition safely. `cognition.timing_ms` reports the Executive assessment and any
+revision separately.
 
-The deterministic topic resolver is intentionally temporary. A later milestone should replace it with a hybrid semantic resolver while retaining stable topic IDs.
+The deterministic topic resolver is intentionally temporary. It is not used for
+general-knowledge retrieval: that path is taxonomy-label indexed.
 
 ## Live model providers and output contracts
 
@@ -470,6 +548,9 @@ docker compose -f docker-compose.yml -f docker-compose.dedicated-providers.yml u
 
 It starts `ollama-left`, `ollama-right`, and `ollama-executive`, reserves NVIDIA GPU access for them, and repoints the three worker containers to their matching provider. It removes the shared scheduler choke point, but can load three copies of the model, so it needs enough available GPU memory. The API includes `cognition.timing_ms` on every chat turn to compare the lobe critical path and executive time between topologies. Confirm the active processor with `docker compose exec ollama-left ollama ps`; a CPU report means provider splitting will usually be slower, not faster.
 
+In dedicated mode the base Ollama service is retained only for the one-time model
+pull; it has no GPU reservation and keeps no model resident after bootstrap.
+
 The workers request documented OpenAI-compatible JSON mode and validate the returned JSON before returning it to the orchestrator. The accepted contracts are intentionally different for each task:
 
 ```text
@@ -495,12 +576,15 @@ GET  /profiles
 GET  /profiles/{character_id}
 POST /profiles
 PUT  /profiles/{character_id}
+GET  /profiles/{character_id}/export
+POST /profiles/{character_id}/diff
+POST /profiles/import
 POST /sessions
 GET  /sessions/{session_id}/events
 POST /sessions/{session_id}/chat
 POST /sessions/{session_id}/reflect
 POST /sessions/{session_id}/close
-GET  /debug/{character_id}
+GET  /debug/{character_id}  # only when ENABLE_DEBUG_API=true
 ```
 
 ### Cognitive worker
@@ -543,7 +627,7 @@ core mutation policy rejects runtime biography changes
 Current result:
 
 ```text
-18 passed
+36 passed
 ```
 
 ## Deliberately deferred
