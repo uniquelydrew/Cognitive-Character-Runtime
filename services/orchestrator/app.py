@@ -4,7 +4,6 @@ import asyncio
 import hmac
 import os
 import re
-import time
 import uuid
 from contextlib import asynccontextmanager
 from functools import wraps
@@ -16,12 +15,11 @@ import httpx
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from fastapi.responses import Response
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field
 
 from services.common import (
     CharacterDocument,
     CognitiveRequest,
-    CognitiveResponse,
     EpistemicType,
     EventRecord,
     InteractionClassification,
@@ -31,6 +29,12 @@ from services.common import (
     RepeatDynamics,
 )
 from services.orchestrator.claims import claim_evidence_catalog, verify_factual_claims
+from services.orchestrator.executive import infer_verified_turn
+from services.orchestrator.inference import (
+    infer as run_inference,
+    infer_timed as run_timed_inference,
+    probe_worker as probe_inference_worker,
+)
 from services.orchestrator.locking import SessionLockRegistry
 from services.orchestrator.relationships import historical_relationships, merge_historical_relationships
 from services.orchestrator.transport import get_json, get_text, post_json, put_json
@@ -889,14 +893,9 @@ async def infer(
     req: CognitiveRequest,
     expected_role: str,
 ) -> dict[str, Any]:
-    data = await post_json(client, f"{base_url}/infer", req.model_dump(mode="json"))
-    try:
-        response = CognitiveResponse.model_validate(data)
-    except ValidationError as exc:
-        raise HTTPException(502, f"{expected_role} worker returned an invalid response envelope: {exc}") from exc
-    if response.role != expected_role:
-        raise HTTPException(502, f"Expected {expected_role} worker response, received {response.role!r}")
-    return response.result
+    """Compatibility façade for validated worker inference."""
+
+    return await run_inference(client, base_url, req, expected_role)
 
 
 async def infer_timed(
@@ -905,29 +904,9 @@ async def infer_timed(
     req: CognitiveRequest,
     expected_role: str,
 ) -> tuple[dict[str, Any], int]:
-    """Return a worker result with monotonic timing for live topology comparisons."""
+    """Compatibility façade for instrumented worker inference."""
 
-    started = time.perf_counter()
-    try:
-        result = await infer(client, base_url, req, expected_role)
-    except Exception:
-        elapsed = round((time.perf_counter() - started) * 1000)
-        metric = MODEL_METRICS[expected_role]
-        metric["calls"] = int(metric["calls"] or 0) + 1
-        metric["failures"] = int(metric["failures"] or 0) + 1
-        metric["last_ms"] = elapsed
-        raise
-    elapsed = round((time.perf_counter() - started) * 1000)
-    metric = MODEL_METRICS[expected_role]
-    calls = int(metric["calls"] or 0) + 1
-    previous_average = metric["average_ms"]
-    metric["calls"] = calls
-    metric["last_ms"] = elapsed
-    metric["average_ms"] = round(
-        elapsed if previous_average is None else ((float(previous_average) * (calls - 1)) + elapsed) / calls,
-        1,
-    )
-    return result, elapsed
+    return await run_timed_inference(client, base_url, req, expected_role, MODEL_METRICS)
 
 
 async def _probe_worker(
@@ -935,32 +914,9 @@ async def _probe_worker(
     role: str,
     url: str,
 ) -> dict[str, Any]:
-    """Probe a role independently so one degraded worker never hides the others."""
+    """Compatibility façade for independently-instrumented worker probes."""
 
-    started = time.perf_counter()
-    try:
-        response = await client.get(f"{url}/health")
-        response.raise_for_status()
-        payload = response.json()
-        if not isinstance(payload, dict):
-            raise ValueError("worker health response was not an object")
-        readiness = "ready"
-        model = str(payload.get("model") or "configured")
-    except (httpx.HTTPError, ValueError, TypeError):
-        readiness = "unavailable"
-        model = None
-    latency = round((time.perf_counter() - started) * 1000)
-    metric = MODEL_METRICS[role]
-    return {
-        "role": role,
-        "status": readiness,
-        "model": model,
-        "health_probe_ms": latency,
-        "calls": int(metric["calls"] or 0),
-        "failures": int(metric["failures"] or 0),
-        "last_inference_ms": metric["last_ms"],
-        "average_inference_ms": metric["average_ms"],
-    }
+    return await probe_inference_worker(client, role, url, MODEL_METRICS)
 
 
 @app.get("/health")
@@ -1506,12 +1462,10 @@ async def chat(session_id: str, req: ChatRequest) -> dict[str, Any]:
                 "right_result": right_result,
             }
         )
-        executive, executive_ms = await infer_timed(client, EXEC_URL, exec_req, "executive")
-        speech = str(executive.get("speech", "")).strip()
-        if not speech:
-            raise HTTPException(502, "Executive produced no speech")
-        executive = {**executive, "speech": speech}
-        claim_audit = verify_factual_claims(executive, common_context["claim_evidence"])
+        executive, claim_audit, executive_ms, claim_revision_used = await infer_verified_turn(
+            client, EXEC_URL, exec_req, common_context["claim_evidence"], MODEL_METRICS
+        )
+        speech = executive["speech"]
 
         repeat_revision_ms = 0
         repeat_revision_used = False
@@ -1555,6 +1509,7 @@ async def chat(session_id: str, req: ChatRequest) -> dict[str, Any]:
             "revision_used": repeat_revision_used,
             "intent_fallback_used": intent_fallback_used,
         }
+        lobe_execution["claim_coverage_revision_used"] = claim_revision_used
 
         executive_escalation = str(executive.get("repeat_escalation", "hold"))
         repeat_dynamics, updated_topic_defensiveness, topic_state_changed = derive_repeat_dynamics(

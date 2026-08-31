@@ -95,6 +95,8 @@ def _system_prompt(mode: str, output_model: type[ModelOutput], *, corrective_ret
             "Use only supplied character data, memories, and context.general_knowledge as established facts. "
             "For every factual assertion in speech, emit a factual_claims item with the exact supporting "
             "context.claim_evidence key. Do not make a factual assertion if no authorized citation exists. "
+            "When context.claim_coverage_retry is present, it records a rejected prior turn: produce a fresh "
+            "response and satisfy its citation requirement exactly. "
             "Never rewrite raw history or immutable core biography. Any state change must be a typed, "
             "evidence-backed mutation proposal."
         ),

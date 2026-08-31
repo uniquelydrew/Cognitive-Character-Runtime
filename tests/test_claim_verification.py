@@ -3,7 +3,9 @@ from __future__ import annotations
 import pytest
 from fastapi import HTTPException
 
+from services.common import CognitiveRequest
 from services.orchestrator.claims import verify_factual_claims
+from services.orchestrator.executive import infer_verified_turn
 from services.orchestrator.relationships import historical_relationships, merge_historical_relationships
 
 
@@ -60,3 +62,30 @@ def test_executive_can_add_a_non_lexical_historical_relationship() -> None:
         "relationship": "clarifies", "target_event_id": "evt_prior", "subject_key": None,
         "confidence": 0.9, "evidence": ["executive_historical_relationship"],
     }]
+
+
+@pytest.mark.asyncio
+async def test_claim_coverage_repair_requires_a_fresh_verified_executive_turn(monkeypatch) -> None:
+    attempts = []
+
+    async def fake_infer(*args, **_kwargs):
+        request = args[2]
+        attempts.append(request.context)
+        if len(attempts) == 1:
+            return {"speech": "I was born in Northbridge.", "factual_claims": []}, 3
+        return {
+            "speech": "I was born in Northbridge.",
+            "factual_claims": [{"text": "I was born in Northbridge.", "evidence_refs": ["identity.birthplace"]}],
+        }, 4
+
+    monkeypatch.setattr("services.orchestrator.executive.infer_timed", fake_infer)
+    request = CognitiveRequest.model_construct(context={})
+    executive, audit, elapsed, repaired = await infer_verified_turn(
+        None, "http://executive", request, {"identity.birthplace": "Northbridge"}, {"executive": {}},
+    )
+
+    assert executive["speech"] == "I was born in Northbridge."
+    assert audit[0]["status"] == "verified"
+    assert elapsed == 7
+    assert repaired is True
+    assert "claim_coverage_retry" in attempts[1]

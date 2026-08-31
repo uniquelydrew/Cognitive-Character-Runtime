@@ -55,6 +55,8 @@ def compare_runs(multi: list[dict[str, Any]], control: list[dict[str, Any]]) -> 
         "multi_wins": sum(delta > 0 for delta in deltas),
         "control_wins": sum(delta < 0 for delta in deltas),
         "ties": sum(delta == 0 for delta in deltas),
+        "multi_failures": sum(not bool(multi_by_id[scenario_id].get("successful", True)) for scenario_id in ids),
+        "control_failures": sum(not bool(control_by_id[scenario_id].get("successful", True)) for scenario_id in ids),
         "rows": rows,
     }
 
@@ -66,11 +68,31 @@ def run_benchmark(base_url: str, token: str, scenarios: list[dict[str, Any]]) ->
     with httpx.Client(base_url=base_url.rstrip("/"), headers=headers, timeout=60) as client:
         for scenario in scenarios:
             session = client.post("/sessions", json={"character_id": scenario["character_id"]})
-            session.raise_for_status()
+            if session.is_error:
+                results.append({
+                    "id": scenario["id"], "expected": scenario["expected"], "successful": False,
+                    "status_code": session.status_code, "error": _response_error(session),
+                })
+                continue
             reply = client.post(f"/sessions/{session.json()['id']}/chat", json={"message": scenario["message"]})
-            reply.raise_for_status()
-            results.append({"id": scenario["id"], "expected": scenario["expected"], **reply.json()})
+            if reply.is_error:
+                results.append({
+                    "id": scenario["id"], "expected": scenario["expected"], "successful": False,
+                    "status_code": reply.status_code, "error": _response_error(reply),
+                })
+                continue
+            results.append({"id": scenario["id"], "expected": scenario["expected"], "successful": True, **reply.json()})
     return results
+
+
+def _response_error(response: httpx.Response) -> Any:
+    """Keep a service failure observable without requiring an exception trace."""
+
+    try:
+        body = response.json()
+    except ValueError:
+        return response.text[:1_000]
+    return body.get("detail", body) if isinstance(body, dict) else body
 
 
 def main() -> None:

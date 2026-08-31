@@ -29,6 +29,12 @@ from services.common import (
     ValidatedMutation,
 )
 from services.memory.migrations import apply_migrations
+from services.memory.records import (
+    add_event as store_event,
+    add_memory as store_memory,
+    get_memories as query_memories,
+    interaction_history as query_interaction_history,
+)
 from services.memory.storage import connection, now_iso
 
 DB_PATH = Path(os.getenv("MEMORY_DATABASE", "/data/cognition.db"))
@@ -1761,45 +1767,9 @@ def reflection_jobs(limit: int = Query(50, ge=1, le=200)) -> dict[str, Any]:
 
 
 def _add_event(event: EventRecord, conn: sqlite3.Connection) -> EventRecord:
-    """Validate and insert an event using an existing transaction."""
+    """Compatibility façade for transactional event persistence."""
 
-    eid = event.id or f"evt_{uuid.uuid4().hex}"
-    ts = now_iso()
-    character = conn.execute("SELECT 1 FROM characters WHERE id=?", (event.character_id,)).fetchone()
-    if not character:
-        raise HTTPException(404, "Character not found")
-    if event.session_id:
-        session = conn.execute(
-            "SELECT character_id, status FROM sessions WHERE id=?", (event.session_id,)
-        ).fetchone()
-        if not session:
-            raise HTTPException(404, "Session not found")
-        if session["character_id"] != event.character_id:
-            raise HTTPException(409, "Event character does not match session character")
-        if session["status"] != "open" and event.event_type != "reflection":
-            raise HTTPException(409, "Interaction is already closed")
-    try:
-        metadata_json = json.dumps(event.metadata, allow_nan=False)
-    except (TypeError, ValueError) as exc:
-        raise HTTPException(422, "Event metadata must be JSON-safe.") from exc
-    conn.execute(
-        """
-        INSERT INTO events(id, character_id, session_id, event_type, actor, content, topic, metadata_json, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            eid,
-            event.character_id,
-            event.session_id,
-            event.event_type,
-            event.actor,
-            event.content,
-            event.topic,
-            metadata_json,
-            ts,
-        ),
-    )
-    return event.model_copy(update={"id": eid})
+    return store_event(event, conn)
 
 
 @app.post("/events", response_model=EventRecord)
@@ -1815,92 +1785,13 @@ def interaction_history(
     limit: int = Query(20, ge=1, le=100),
 ) -> dict[str, Any]:
     with db() as conn:
-        rows = conn.execute(
-            """
-            SELECT * FROM events
-            WHERE character_id=? AND topic=? AND event_type IN ('user_message', 'character_message')
-            ORDER BY created_at DESC, rowid DESC LIMIT ?
-            """,
-            (character_id, topic, limit),
-        ).fetchall()
-    raw_events = [dict(r) for r in reversed(rows)]
-    events = [{**row, "metadata": json.loads(row["metadata_json"])} for row in raw_events]
-    answered_user_ids = {
-        str(event["metadata"].get("responds_to"))
-        for event in events
-        if event["event_type"] == "character_message" and event["metadata"].get("responds_to")
-    }
-    # An upstream model failure can leave a user event without a character
-    # response. It remains available in the raw session audit trail, but must not
-    # count as an answered question or make a retry look adversarial.
-    completed_events = [
-        event
-        for event in events
-        if event["event_type"] == "character_message" or event["id"] in answered_user_ids
-    ]
-    user_questions = [event for event in completed_events if event["event_type"] == "user_message"]
-    prior_answer = None
-    for event in reversed(completed_events):
-        if event["event_type"] == "character_message":
-            prior_answer = event["content"]
-            break
-    return {
-        "topic": topic,
-        "times_asked": len(user_questions),
-        "prior_answer": prior_answer,
-        "events": [
-            {
-                "id": r["id"],
-                "event_type": r["event_type"],
-                "actor": r["actor"],
-                "content": r["content"],
-                "topic": r["topic"],
-                "metadata": r["metadata"],
-                "created_at": r["created_at"],
-            }
-            for r in completed_events
-        ],
-    }
+        return query_interaction_history(character_id, topic, limit, conn)
 
 
 def _add_memory(memory: MemoryRecord, conn: sqlite3.Connection) -> MemoryRecord:
-    """Validate and insert a memory using an existing transaction."""
+    """Compatibility façade for transactional memory persistence."""
 
-    mid = memory.id or f"mem_{uuid.uuid4().hex}"
-    ts = now_iso()
-    character = conn.execute("SELECT 1 FROM characters WHERE id=?", (memory.character_id,)).fetchone()
-    if not character:
-        raise HTTPException(404, "Character not found")
-    source_ids = [source_id.strip() for source_id in memory.source_event_ids]
-    if len(source_ids) != len(set(source_ids)) or any(not source_id for source_id in source_ids):
-        raise HTTPException(422, "Memory provenance must contain distinct, non-empty event IDs.")
-    if source_ids:
-        placeholders = ", ".join("?" for _ in source_ids)
-        rows = conn.execute(
-            f"SELECT id FROM events WHERE character_id=? AND id IN ({placeholders})",
-            [memory.character_id, *source_ids],
-        ).fetchall()
-        if {str(row["id"]) for row in rows} != set(source_ids):
-            raise HTTPException(422, "Memory provenance must reference recorded events for this character.")
-    try:
-        metadata_json = json.dumps(memory.metadata, allow_nan=False)
-    except (TypeError, ValueError) as exc:
-        raise HTTPException(422, "Memory metadata must be JSON-safe.") from exc
-    conn.execute(
-        """
-        INSERT INTO memories(
-            id, character_id, kind, topic, content, epistemic_type, confidence, salience,
-            source_event_ids_json, status, superseded_by, metadata_json, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            mid, memory.character_id, memory.kind, memory.topic, memory.content,
-            memory.epistemic_type.value, memory.confidence, memory.salience,
-            json.dumps(source_ids), memory.status, memory.superseded_by,
-            metadata_json, ts, ts,
-        ),
-    )
-    return memory.model_copy(update={"id": mid})
+    return store_memory(memory, conn)
 
 
 @app.post("/memories", response_model=MemoryRecord)
@@ -1915,27 +1806,8 @@ def get_memories(
     topic: str | None = None,
     limit: int = Query(20, ge=1, le=100),
 ) -> list[dict[str, Any]]:
-    clauses = ["character_id=?", "status='active'"]
-    args: list[Any] = [character_id]
-    if topic:
-        clauses.append("(topic=? OR topic IS NULL)")
-        args.append(topic)
-    args.append(limit)
     with db() as conn:
-        rows = conn.execute(
-            f"SELECT * FROM memories WHERE {' AND '.join(clauses)} ORDER BY salience DESC, created_at DESC LIMIT ?",
-            args,
-        ).fetchall()
-    return [
-        {
-            "id": r["id"], "character_id": r["character_id"], "kind": r["kind"], "topic": r["topic"],
-            "content": r["content"], "epistemic_type": r["epistemic_type"], "confidence": r["confidence"],
-            "salience": r["salience"], "source_event_ids": json.loads(r["source_event_ids_json"]),
-            "status": r["status"], "superseded_by": r["superseded_by"], "metadata": json.loads(r["metadata_json"]),
-            "created_at": r["created_at"], "updated_at": r["updated_at"],
-        }
-        for r in rows
-    ]
+        return query_memories(character_id, topic, limit, conn)
 
 
 def validate_proposal(
