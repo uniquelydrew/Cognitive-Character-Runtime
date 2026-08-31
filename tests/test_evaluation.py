@@ -9,6 +9,7 @@ def test_paired_evaluation_reports_observable_correctness_delta() -> None:
     assert report["mean_correctness_delta"] == 1.0
     assert report["multi_wins"] == 1
     assert report["improvement_supported"] is True
+    assert report["mean_valid_response_delta"] == 0.0
 
 
 def test_benchmark_runner_retains_scenario_identity(monkeypatch) -> None:

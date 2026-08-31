@@ -44,6 +44,7 @@ def compare_runs(multi: list[dict[str, Any]], control: list[dict[str, Any]]) -> 
     if not ids:
         raise ValueError("No shared scenario IDs between multi and control results.")
     deltas: list[float] = []
+    success_deltas: list[float] = []
     rows: list[dict[str, Any]] = []
     for scenario_id in ids:
         left, right = multi_by_id[scenario_id], control_by_id[scenario_id]
@@ -51,13 +52,18 @@ def compare_runs(multi: list[dict[str, Any]], control: list[dict[str, Any]]) -> 
         multi_score, control_score = score_response(left, expected), score_response(right, expected)
         delta = multi_score["correctness"] - control_score["correctness"]
         deltas.append(delta)
+        success_deltas.append(float(bool(left.get("successful", True))) - float(bool(right.get("successful", True))))
         rows.append({"id": scenario_id, "multi": multi_score, "control": control_score, "correctness_delta": delta})
     interval = _bootstrap_mean_interval(deltas)
+    success_interval = _bootstrap_mean_interval(success_deltas)
     return {
         "scenarios": len(ids),
         "mean_correctness_delta": mean(deltas),
         "correctness_delta_95_ci": interval,
         "improvement_supported": interval[0] > 0,
+        "mean_valid_response_delta": mean(success_deltas),
+        "valid_response_delta_95_ci": success_interval,
+        "valid_response_improvement_supported": success_interval[0] > 0,
         "multi_wins": sum(delta > 0 for delta in deltas),
         "control_wins": sum(delta < 0 for delta in deltas),
         "ties": sum(delta == 0 for delta in deltas),
