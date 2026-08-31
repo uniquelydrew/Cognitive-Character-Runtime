@@ -88,6 +88,8 @@ def test_character_continuity_and_reflection(tmp_path: Path):
                 "LEFT_URL": f"http://127.0.0.1:{ports['left']}",
                 "RIGHT_URL": f"http://127.0.0.1:{ports['right']}",
                 "EXEC_URL": f"http://127.0.0.1:{ports['exec']}",
+                "SEMANTIC_EMBEDDING_URL": f"http://127.0.0.1:{ports['provider']}/api/embed",
+                "SEMANTIC_EMBEDDING_MODEL": "test-embed",
                 "API_AUTH_TOKEN": "integration-test-token",
                 "ENABLE_DEBUG_API": "true",
             },
@@ -96,12 +98,21 @@ def test_character_continuity_and_reflection(tmp_path: Path):
 
         base = f"http://127.0.0.1:{ports['orch']}"
         headers = {"X-API-Key": "integration-test-token"}
+        runtime_before_turn = httpx.get(
+            f"{base}/status?character_id=elena_voss", headers=headers, timeout=10
+        ).json()
+        assert runtime_before_turn["status"] == "ready"
+        assert {worker["role"] for worker in runtime_before_turn["workers"]} == {"left", "right", "executive"}
+        assert runtime_before_turn["cognitive_priorities"]["left_weight"] == 0.67
+        assert runtime_before_turn["cognitive_priorities"]["primary_role"] == "left"
         session = httpx.post(f"{base}/sessions", json={"character_id": "elena_voss"}, headers=headers).json()
         sid = session["id"]
 
         first = httpx.post(f"{base}/sessions/{sid}/chat", json={"message": "Where were you born?"}, headers=headers, timeout=10).json()
         assert first["message"] == "Northbridge"
         assert first["interaction"]["interaction_type"] == "new_subject"
+        assert first["cognition"]["lobe_execution"]["transcript_events"] == 0
+        assert first["cognition"]["weighted_arbitration"]["primary_role"] == "left"
 
         repeat_payload = {"message": "What's your hometown again?", "idempotency_key": "repeat-question-key"}
         second = httpx.post(f"{base}/sessions/{sid}/chat", json=repeat_payload, headers=headers, timeout=10).json()
@@ -109,6 +120,10 @@ def test_character_continuity_and_reflection(tmp_path: Path):
         assert "asked me that before" in second["message"]
         assert second["interaction"]["interaction_type"] == "repeated_question"
         assert second["interaction"]["times_asked"] == 2
+        assert second["cognition"]["lobe_execution"]["transcript_events"] == 2
+        assert second["cognition"]["repeat_review"]["embedding"]["available"] is True
+        runtime_after_turn = httpx.get(f"{base}/status?character_id=elena_voss", headers=headers, timeout=10).json()
+        assert all(worker["calls"] >= 1 for worker in runtime_after_turn["workers"])
         replay = httpx.post(f"{base}/sessions/{sid}/chat", json=repeat_payload, headers=headers, timeout=10).json()
         assert replay["idempotent_replay"] is True
         assert replay["message"] == second["message"]

@@ -8,11 +8,12 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from functools import wraps
+from math import isfinite, sqrt
 from typing import Any
 from urllib.parse import urlencode
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from fastapi.responses import Response
 from pydantic import BaseModel, Field, ValidationError
@@ -38,6 +39,16 @@ WORKER_REQUEST_TIMEOUT_SECONDS = float(os.getenv("WORKER_REQUEST_TIMEOUT_SECONDS
 TURN_TIMEOUT_SECONDS = float(os.getenv("TURN_TIMEOUT_SECONDS", "240"))
 SESSION_QUEUE_TIMEOUT_SECONDS = float(os.getenv("SESSION_QUEUE_TIMEOUT_SECONDS", "15"))
 MAX_CONCURRENT_TURNS = int(os.getenv("MAX_CONCURRENT_TURNS", "2"))
+MAX_LOBE_TRANSCRIPT_EVENTS = int(os.getenv("MAX_LOBE_TRANSCRIPT_EVENTS", "10"))
+MAX_LOBE_TRANSCRIPT_CHARS = int(os.getenv("MAX_LOBE_TRANSCRIPT_CHARS", "6000"))
+MAX_LOBE_TRANSCRIPT_EVENT_CHARS = int(os.getenv("MAX_LOBE_TRANSCRIPT_EVENT_CHARS", "1200"))
+SEMANTIC_EMBEDDING_URL = os.getenv("SEMANTIC_EMBEDDING_URL", "http://ollama:11434/api/embed").rstrip("/")
+SEMANTIC_EMBEDDING_MODEL = os.getenv("SEMANTIC_EMBEDDING_MODEL", "all-minilm")
+SEMANTIC_EMBEDDING_TIMEOUT_SECONDS = float(os.getenv("SEMANTIC_EMBEDDING_TIMEOUT_SECONDS", "8"))
+SEMANTIC_REPEAT_SIMILARITY_THRESHOLD = float(os.getenv("SEMANTIC_REPEAT_SIMILARITY_THRESHOLD", "0.80"))
+SEMANTIC_REPEAT_MAX_CANDIDATES = int(os.getenv("SEMANTIC_REPEAT_MAX_CANDIDATES", "12"))
+REFLECTION_RETRY_POLL_SECONDS = float(os.getenv("REFLECTION_RETRY_POLL_SECONDS", "30"))
+REFLECTION_RETRY_LEASE_SECONDS = int(os.getenv("REFLECTION_RETRY_LEASE_SECONDS", "300"))
 DEBUG_API_ENABLED = os.getenv("ENABLE_DEBUG_API", "").lower() in {"1", "true", "yes"}
 API_AUTH_TOKEN = os.getenv("API_AUTH_TOKEN", "")
 CONTENT_TOKEN_RE = re.compile(r"[a-z0-9']+")
@@ -58,11 +69,39 @@ if (
     or TURN_TIMEOUT_SECONDS <= 0
     or SESSION_QUEUE_TIMEOUT_SECONDS <= 0
     or MAX_CONCURRENT_TURNS <= 0
+    or MAX_LOBE_TRANSCRIPT_EVENTS <= 0
+    or MAX_LOBE_TRANSCRIPT_CHARS < 500
+    or MAX_LOBE_TRANSCRIPT_EVENT_CHARS < 200
+    or SEMANTIC_EMBEDDING_TIMEOUT_SECONDS <= 0
+    or SEMANTIC_REPEAT_MAX_CANDIDATES <= 0
+    or REFLECTION_RETRY_POLL_SECONDS <= 0
+    or REFLECTION_RETRY_LEASE_SECONDS <= 0
 ):
-    raise RuntimeError("Worker, turn, queue, and concurrent-turn limits must be positive")
+    raise RuntimeError("Runtime limits must be positive and transcript bounds must be practical")
+if not 0.0 < SEMANTIC_REPEAT_SIMILARITY_THRESHOLD <= 1.0:
+    raise RuntimeError("SEMANTIC_REPEAT_SIMILARITY_THRESHOLD must be between 0 and 1")
 
 SESSION_TURN_LOCKS: dict[str, asyncio.Lock] = {}
 TURN_CAPACITY = asyncio.Semaphore(MAX_CONCURRENT_TURNS)
+MODEL_METRICS: dict[str, dict[str, int | float | None]] = {
+    role: {"calls": 0, "failures": 0, "last_ms": None, "average_ms": None}
+    for role in ("left", "right", "executive")
+}
+
+
+@asynccontextmanager
+async def orchestrator_lifespan(_: FastAPI):
+    """Retry failed close-time reflections without keeping sessions open."""
+
+    task = asyncio.create_task(_deferred_reflection_retry_loop())
+    try:
+        yield
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 app = FastAPI(
     title="Cognitive Character Orchestrator",
@@ -70,6 +109,7 @@ app = FastAPI(
     docs_url=None,
     redoc_url=None,
     openapi_url=None,
+    lifespan=orchestrator_lifespan,
 )
 
 
@@ -106,6 +146,10 @@ class ProfileImportRequest(BaseModel):
 
 
 class ProfileDiffRequest(BaseModel):
+    yaml: str = Field(min_length=1, max_length=5_000_000)
+
+
+class KnowledgeCatalogRequest(BaseModel):
     yaml: str = Field(min_length=1, max_length=5_000_000)
 
 
@@ -193,6 +237,197 @@ def _token_similarity(left: str, right: str) -> float:
     if not left_tokens or not right_tokens:
         return 0.0
     return len(left_tokens & right_tokens) / len(left_tokens | right_tokens)
+
+
+def resolve_cognitive_priorities(character: CharacterDocument | None) -> dict[str, Any]:
+    """Normalize an author's Left/Right priorities into an enforceable turn policy.
+
+    The values are source-controlled primer inputs rather than mutable mood. A
+    malformed or absent value falls back to a balanced system, avoiding a bad
+    profile edit silently starving either cognitive role.
+    """
+
+    cognition = character.cognition if character is not None else {}
+
+    def weight(name: str) -> float:
+        value = cognition.get(name, 0.5) if isinstance(cognition, dict) else 0.5
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return 0.5
+        return numeric if isfinite(numeric) and numeric >= 0 else 0.5
+
+    left_raw = weight("left_weight")
+    right_raw = weight("right_weight")
+    total = left_raw + right_raw
+    left = 0.5 if total <= 0 else left_raw / total
+    right = 0.5 if total <= 0 else right_raw / total
+    difference = left - right
+    primary_role = "balanced" if abs(difference) < 0.08 else ("left" if difference > 0 else "right")
+    return {
+        "left_weight": round(left, 4),
+        "right_weight": round(right, 4),
+        "primary_role": primary_role,
+        "weight_gap": round(abs(difference), 4),
+        # Facts and declared constraints never become optional just because the
+        # associative hemisphere is configured as primary for delivery choices.
+        "invariant": "left_constraints_bind",
+        "enforcement": "weighted_arbitration_plan_and_role_attention_budget",
+    }
+
+
+def bounded_lobe_transcript(session_events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return a recent raw conversation window with hard event and character caps.
+
+    It deliberately carries raw event content rather than a model summary, while
+    keeping an old session from consuming lobe context or response time.
+    """
+
+    selected: list[dict[str, Any]] = []
+    remaining = MAX_LOBE_TRANSCRIPT_CHARS
+    conversation = [
+        event
+        for event in session_events
+        if event.get("event_type") in {"user_message", "character_message"}
+    ]
+    for event in reversed(conversation[-MAX_LOBE_TRANSCRIPT_EVENTS:]):
+        content = str(event.get("content") or "").strip()
+        if not content or remaining <= 0:
+            continue
+        permitted = min(MAX_LOBE_TRANSCRIPT_EVENT_CHARS, remaining)
+        clipped = content[:permitted]
+        selected.append(
+            {
+                "event_id": str(event.get("id") or ""),
+                "event_type": str(event.get("event_type") or ""),
+                "actor": event.get("actor"),
+                "content": clipped,
+                "topic": event.get("topic"),
+                "content_truncated": len(clipped) < len(content),
+            }
+        )
+        remaining -= len(clipped)
+    return list(reversed(selected))
+
+
+def weighted_arbitration_plan(
+    priorities: dict[str, Any],
+    left_result: dict[str, Any],
+    right_result: dict[str, Any],
+) -> dict[str, Any]:
+    """Materialize the authored weighting as bounded, auditable executive input."""
+
+    primary = str(priorities["primary_role"])
+    left_packet = {
+        "weight": priorities["left_weight"],
+        "action": str(left_result.get("action") or "answer"),
+        "fact_refs": [str(item) for item in left_result.get("fact_refs", [])[:4]],
+        "constraints": [str(item) for item in left_result.get("constraints", [])[:3]],
+    }
+    right_packet = {
+        "weight": priorities["right_weight"],
+        "action": str(right_result.get("action") or "inform"),
+        "tone": str(right_result.get("tone") or "neutral"),
+        "risk": str(right_result.get("risk") or "low"),
+        "association_keys": [str(item) for item in right_result.get("association_keys", [])[:4]],
+    }
+    primary_packet = left_packet if primary == "left" else right_packet if primary == "right" else None
+    return {
+        "priorities": priorities,
+        "primary_role": primary,
+        "primary_packet": primary_packet,
+        "left": left_packet,
+        "right": right_packet,
+        "binding_rules": [
+            "left.constraints are binding; right affect or tone cannot override them",
+            (
+                f"when non-factual response choices conflict, favor the {primary} packet"
+                if primary in {"left", "right"}
+                else "when non-factual response choices conflict, balance both packets"
+            ),
+        ],
+    }
+
+
+def _cosine_similarity(left: list[float], right: list[float]) -> float | None:
+    if not left or len(left) != len(right):
+        return None
+    try:
+        dot = sum(a * b for a, b in zip(left, right))
+        left_norm = sqrt(sum(a * a for a in left))
+        right_norm = sqrt(sum(b * b for b in right))
+    except (TypeError, ValueError):
+        return None
+    if not isfinite(dot) or left_norm <= 0 or right_norm <= 0:
+        return None
+    score = dot / (left_norm * right_norm)
+    return score if isfinite(score) else None
+
+
+async def semantic_repeat_evidence(
+    client: httpx.AsyncClient,
+    message: str,
+    prior_users: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Use a small embedding model after lobe work to find non-lexical repeats.
+
+    The embedding call is bounded to recent answered questions. It fails closed
+    to existing deterministic/lobe evidence so an optional semantic accelerator
+    can never make a normal character turn unavailable.
+    """
+
+    candidates = [
+        event for event in prior_users[-SEMANTIC_REPEAT_MAX_CANDIDATES:]
+        if str(event.get("content") or "").strip() and str(event.get("id") or "")
+    ]
+    if not SEMANTIC_EMBEDDING_URL or not SEMANTIC_EMBEDDING_MODEL or not candidates:
+        return {
+            "available": False,
+            "model": SEMANTIC_EMBEDDING_MODEL or None,
+            "threshold": SEMANTIC_REPEAT_SIMILARITY_THRESHOLD,
+            "matches": {},
+            "reason": "no_embedding_candidates_or_configuration",
+        }
+    inputs = [message, *[str(event["content"]) for event in candidates]]
+    try:
+        response = await client.post(
+            SEMANTIC_EMBEDDING_URL,
+            json={"model": SEMANTIC_EMBEDDING_MODEL, "input": inputs, "truncate": True},
+            timeout=SEMANTIC_EMBEDDING_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        vectors = payload.get("embeddings", []) if isinstance(payload, dict) else []
+        if not isinstance(vectors, list) or len(vectors) != len(inputs):
+            raise ValueError("embedding provider returned an unexpected vector count")
+        parsed = [
+            [float(value) for value in vector]
+            for vector in vectors
+            if isinstance(vector, list)
+        ]
+        if len(parsed) != len(inputs):
+            raise ValueError("embedding provider returned a non-vector value")
+    except (httpx.HTTPError, TypeError, ValueError):
+        return {
+            "available": False,
+            "model": SEMANTIC_EMBEDDING_MODEL,
+            "threshold": SEMANTIC_REPEAT_SIMILARITY_THRESHOLD,
+            "matches": {},
+            "reason": "embedding_provider_unavailable",
+        }
+
+    matches: dict[str, float] = {}
+    for event, vector in zip(candidates, parsed[1:]):
+        score = _cosine_similarity(parsed[0], vector)
+        if score is not None:
+            matches[str(event["id"])] = round(score, 4)
+    return {
+        "available": True,
+        "model": str(payload.get("model") or SEMANTIC_EMBEDDING_MODEL),
+        "threshold": SEMANTIC_REPEAT_SIMILARITY_THRESHOLD,
+        "matches": matches,
+        "reason": "embedding_similarity",
+    }
 
 
 def _response_terms(text: str) -> set[str]:
@@ -412,6 +647,8 @@ def executive_repeat_review(
     left_result: dict[str, Any],
     right_result: dict[str, Any],
     prior_times: int,
+    embedding_matches: dict[str, float] | None = None,
+    embedding_threshold: float = SEMANTIC_REPEAT_SIMILARITY_THRESHOLD,
 ) -> dict[str, Any]:
     """Review repeat evidence after both hemisphere analyses and before executive speech.
 
@@ -441,6 +678,7 @@ def executive_repeat_review(
     )
     current_fact_refs = _analysis_keys(left_result, "fact_refs")
 
+    embedding_matches = embedding_matches or {}
     best: dict[str, Any] | None = None
     for user_event in prior_users:
         score = 0.0
@@ -452,6 +690,10 @@ def executive_repeat_review(
         lexical_score = _token_similarity(message, str(user_event.get("content", "")))
         if lexical_score > score:
             score, reason = lexical_score, "overlapping subject language"
+
+        embedding_score = float(embedding_matches.get(str(user_event.get("id")), 0.0))
+        if embedding_score >= embedding_threshold and embedding_score > score:
+            score, reason = embedding_score, "embedding similarity"
 
         prior_reply = replies_by_user.get(str(user_event.get("id")))
         prior_review = (prior_reply or {}).get("metadata", {}).get("repeat_review", {})
@@ -494,6 +736,7 @@ def executive_repeat_review(
             "answer": (prior_reply or {}).get("content"),
             "score": round(score, 3),
             "reason": reason,
+            "embedding_similarity": round(embedding_score, 4) if embedding_score else None,
         }
         if best is None or candidate["score"] > best["score"]:
             best = candidate
@@ -537,6 +780,8 @@ def executive_repeat_review(
         "matched_event_id": (best or {}).get("event_id"),
         "matched_answer": (best or {}).get("answer"),
         "confidence": float((best or {}).get("score", 0.0)),
+        "embedding_similarity": (best or {}).get("embedding_similarity"),
+        "embedding_threshold": embedding_threshold,
         "reason": (best or {}).get("reason", "no prior semantic match"),
         "consecutive_repeats": consecutive_repeats,
         "recent_turns": recent_turns,
@@ -658,7 +903,7 @@ async def put_json(client: httpx.AsyncClient, url: str, payload: Any) -> Any:
     try:
         r = await client.put(url, json=payload)
     except httpx.TimeoutException as exc:
-        raise HTTPException(504, "The profile update took too long. Please retry.") from exc
+        raise HTTPException(504, "The update took too long. Please retry.") from exc
     except httpx.RequestError as exc:
         raise HTTPException(503, "A required service is unavailable. Please retry shortly.") from exc
     if r.status_code >= 400:
@@ -670,9 +915,9 @@ async def get_text(client: httpx.AsyncClient, url: str) -> httpx.Response:
     try:
         response = await client.get(url)
     except httpx.TimeoutException as exc:
-        raise HTTPException(504, "The profile export took too long. Please retry.") from exc
+        raise HTTPException(504, "The export took too long. Please retry.") from exc
     except httpx.RequestError as exc:
-        raise HTTPException(503, "The profile export service is unavailable. Please retry shortly.") from exc
+        raise HTTPException(503, "The export service is unavailable. Please retry shortly.") from exc
     if response.status_code >= 400:
         raise HTTPException(response.status_code, _upstream_detail(response))
     return response
@@ -723,8 +968,59 @@ async def infer_timed(
     """Return a worker result with monotonic timing for live topology comparisons."""
 
     started = time.perf_counter()
-    result = await infer(client, base_url, req, expected_role)
-    return result, round((time.perf_counter() - started) * 1000)
+    try:
+        result = await infer(client, base_url, req, expected_role)
+    except Exception:
+        elapsed = round((time.perf_counter() - started) * 1000)
+        metric = MODEL_METRICS[expected_role]
+        metric["calls"] = int(metric["calls"] or 0) + 1
+        metric["failures"] = int(metric["failures"] or 0) + 1
+        metric["last_ms"] = elapsed
+        raise
+    elapsed = round((time.perf_counter() - started) * 1000)
+    metric = MODEL_METRICS[expected_role]
+    calls = int(metric["calls"] or 0) + 1
+    previous_average = metric["average_ms"]
+    metric["calls"] = calls
+    metric["last_ms"] = elapsed
+    metric["average_ms"] = round(
+        elapsed if previous_average is None else ((float(previous_average) * (calls - 1)) + elapsed) / calls,
+        1,
+    )
+    return result, elapsed
+
+
+async def _probe_worker(
+    client: httpx.AsyncClient,
+    role: str,
+    url: str,
+) -> dict[str, Any]:
+    """Probe a role independently so one degraded worker never hides the others."""
+
+    started = time.perf_counter()
+    try:
+        response = await client.get(f"{url}/health")
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise ValueError("worker health response was not an object")
+        readiness = "ready"
+        model = str(payload.get("model") or "configured")
+    except (httpx.HTTPError, ValueError, TypeError):
+        readiness = "unavailable"
+        model = None
+    latency = round((time.perf_counter() - started) * 1000)
+    metric = MODEL_METRICS[role]
+    return {
+        "role": role,
+        "status": readiness,
+        "model": model,
+        "health_probe_ms": latency,
+        "calls": int(metric["calls"] or 0),
+        "failures": int(metric["failures"] or 0),
+        "last_inference_ms": metric["last_ms"],
+        "average_inference_ms": metric["average_ms"],
+    }
 
 
 @app.get("/health")
@@ -740,6 +1036,65 @@ async def health() -> dict[str, Any]:
     # Liveness must not disclose provider URLs, model names, or internal errors
     # to an unauthenticated health probe.
     return {"status": "ok" if all(not isinstance(x, Exception) for x in checks) else "degraded"}
+
+
+@app.get("/status")
+async def runtime_status(character_id: str | None = Query(default=None, min_length=1, max_length=64)) -> dict[str, Any]:
+    """Expose authenticated, per-role readiness and the effective profile weighting."""
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        workers = await asyncio.gather(
+            _probe_worker(client, "left", LEFT_URL),
+            _probe_worker(client, "right", RIGHT_URL),
+            _probe_worker(client, "executive", EXEC_URL),
+        )
+        try:
+            memory_response = await client.get(f"{MEMORY_URL}/health")
+            memory_response.raise_for_status()
+            memory_status = "ready"
+        except httpx.HTTPError:
+            memory_status = "unavailable"
+
+        retry_jobs: dict[str, Any] = {"jobs": [], "pending_count": None}
+        if memory_status == "ready":
+            try:
+                retry_response = await client.get(f"{MEMORY_URL}/reflection-jobs?limit=20")
+                retry_response.raise_for_status()
+                payload = retry_response.json()
+                if isinstance(payload, dict):
+                    retry_jobs = payload
+            except (httpx.HTTPError, ValueError):
+                retry_jobs = {"jobs": [], "pending_count": None}
+
+        character: CharacterDocument | None = None
+        if character_id:
+            try:
+                character, _ = await load_character(client, character_id)
+            except HTTPException:
+                # Model availability must remain visible even if a profile was
+                # deleted between the selector refresh and this status request.
+                character = None
+
+    priorities = resolve_cognitive_priorities(character)
+    ready = memory_status == "ready" and all(worker["status"] == "ready" for worker in workers)
+    return {
+        "status": "ready" if ready else "degraded",
+        "memory": {"status": memory_status},
+        "workers": workers,
+        "character_id": character.id if character is not None else None,
+        "cognitive_priorities": priorities,
+        "semantic_repeat": {
+            "embedding_model": SEMANTIC_EMBEDDING_MODEL or None,
+            "embedding_configured": bool(SEMANTIC_EMBEDDING_URL and SEMANTIC_EMBEDDING_MODEL),
+            "similarity_threshold": SEMANTIC_REPEAT_SIMILARITY_THRESHOLD,
+        },
+        "reflection_retry": {
+            "poll_seconds": REFLECTION_RETRY_POLL_SECONDS,
+            "lease_seconds": REFLECTION_RETRY_LEASE_SECONDS,
+            "pending_count": retry_jobs.get("pending_count"),
+            "jobs": retry_jobs.get("jobs", []),
+        },
+    }
 
 
 @app.get("/characters")
@@ -811,6 +1166,60 @@ async def diff_profile(character_id: str, request: ProfileDiffRequest) -> Any:
             f"{MEMORY_URL}/profiles/{character_id}/diff",
             request.model_dump(),
         )
+
+
+@app.get("/knowledge/catalog")
+async def knowledge_catalog() -> Any:
+    async with httpx.AsyncClient(timeout=20) as client:
+        return await get_json(client, f"{MEMORY_URL}/knowledge/catalog")
+
+
+@app.get("/knowledge/export")
+async def export_knowledge_catalog() -> Response:
+    async with httpx.AsyncClient(timeout=30) as client:
+        upstream = await get_text(client, f"{MEMORY_URL}/knowledge/export")
+    return Response(
+        content=upstream.content,
+        media_type=upstream.headers.get("content-type", "application/yaml"),
+        headers={
+            "Content-Disposition": upstream.headers.get(
+                "content-disposition", 'attachment; filename="knowledge-catalog.yaml"'
+            )
+        },
+    )
+
+
+@app.get("/knowledge/schema-sample")
+async def export_knowledge_schema_sample() -> Response:
+    async with httpx.AsyncClient(timeout=20) as client:
+        upstream = await get_text(client, f"{MEMORY_URL}/knowledge/schema-sample")
+    return Response(
+        content=upstream.content,
+        media_type=upstream.headers.get("content-type", "application/yaml"),
+        headers={
+            "Content-Disposition": upstream.headers.get(
+                "content-disposition", 'attachment; filename="catalog.example.yaml"'
+            )
+        },
+    )
+
+
+@app.post("/knowledge/validate")
+async def validate_knowledge_catalog(request: KnowledgeCatalogRequest) -> Any:
+    async with httpx.AsyncClient(timeout=30) as client:
+        return await post_json(client, f"{MEMORY_URL}/knowledge/validate", request.model_dump())
+
+
+@app.put("/knowledge/catalog")
+async def update_knowledge_catalog(request: KnowledgeCatalogRequest) -> Any:
+    async with httpx.AsyncClient(timeout=30) as client:
+        return await put_json(client, f"{MEMORY_URL}/knowledge/catalog", request.model_dump())
+
+
+@app.post("/knowledge/import")
+async def import_knowledge_catalog(request: KnowledgeCatalogRequest) -> Any:
+    async with httpx.AsyncClient(timeout=30) as client:
+        return await post_json(client, f"{MEMORY_URL}/knowledge/import", request.model_dump())
 
 
 @app.post("/sessions")
@@ -906,6 +1315,9 @@ async def chat(session_id: str, req: ChatRequest) -> dict[str, Any]:
                             "right": metadata.get("right", {}),
                             "executive": metadata.get("executive", {}),
                             "lobe_execution": metadata.get("lobe_execution", {}),
+                            "repeat_review": metadata.get("repeat_review", {}),
+                            "cognitive_priorities": metadata.get("cognitive_priorities", {}),
+                            "weighted_arbitration": metadata.get("weighted_arbitration", {}),
                             "timing_ms": {"replayed": True},
                         },
                         "memory_writes": [],
@@ -942,17 +1354,25 @@ async def chat(session_id: str, req: ChatRequest) -> dict[str, Any]:
         knowledge_context = await get_json(
             client, f"{MEMORY_URL}/knowledge/for-character/{character_id}?{knowledge_query}"
         )
+        cognitive_priorities = resolve_cognitive_priorities(character)
+        lobe_transcript = bounded_lobe_transcript(prior_transcript)
         common_context = {
             "interaction": classification.model_dump(mode="json"),
             "memories": memories,
             "mutable_state": state.get("mutable_state", {}),
             "beliefs": state.get("beliefs", {}),
             "goals": state.get("goals", []),
+            "cognitive_priorities": cognitive_priorities,
             # This is a label-authorized view of the static general corpus. Raw
             # corpus records and denied classifications never reach a model.
             "general_knowledge": knowledge_context.get("items", []),
         }
-        cognition_req = CognitiveRequest(character=character, user_input=req.message, context=common_context)
+        cognition_req = CognitiveRequest(
+            character=character,
+            user_input=req.message,
+            context=common_context,
+            transcript=lobe_transcript,
+        )
 
         if lobe_reuse:
             left_result = dict(lobe_reuse["left"])
@@ -965,16 +1385,60 @@ async def chat(session_id: str, req: ChatRequest) -> dict[str, Any]:
                 "reason": lobe_reuse["reason"],
             }
         else:
-            left_task = infer_timed(client, LEFT_URL, cognition_req, "left")
-            right_task = infer_timed(client, RIGHT_URL, cognition_req, "right")
+            left_req = cognition_req.model_copy(
+                update={
+                    "context": {
+                        **common_context,
+                        "role_attention": {
+                            "role": "left",
+                            "weight": cognitive_priorities["left_weight"],
+                            "attention_budget": round(0.5 + cognitive_priorities["left_weight"], 4),
+                        },
+                    }
+                }
+            )
+            right_req = cognition_req.model_copy(
+                update={
+                    "context": {
+                        **common_context,
+                        "role_attention": {
+                            "role": "right",
+                            "weight": cognitive_priorities["right_weight"],
+                            "attention_budget": round(0.5 + cognitive_priorities["right_weight"], 4),
+                        },
+                    }
+                }
+            )
+            left_task = infer_timed(client, LEFT_URL, left_req, "left")
+            right_task = infer_timed(client, RIGHT_URL, right_req, "right")
             (left_result, left_ms), (right_result, right_ms) = await asyncio.gather(left_task, right_task)
-            lobe_execution = {"mode": "fresh"}
+            lobe_execution = {
+                "mode": "fresh",
+                "transcript_events": len(lobe_transcript),
+                "transcript_characters": sum(len(str(event["content"])) for event in lobe_transcript),
+            }
 
         # The lobes are intentionally free to arrive at overlapping thoughts. The
         # executive receives a separate, bounded review after both are complete so
         # it can recognize a rephrased repeat without making either lobe suppress
         # its own reasoning.
         transcript = await get_json(client, f"{MEMORY_URL}/sessions/{session_id}/events?limit=200")
+        prior_answered_users = [
+            event
+            for event in prior_transcript
+            if event.get("event_type") == "user_message" and str(event.get("id")) in replies_by_user
+        ]
+        embedding_evidence = (
+            await semantic_repeat_evidence(client, req.message, prior_answered_users)
+            if not lobe_reuse
+            else {
+                "available": False,
+                "model": SEMANTIC_EMBEDDING_MODEL,
+                "threshold": SEMANTIC_REPEAT_SIMILARITY_THRESHOLD,
+                "matches": {},
+                "reason": "exact_repeat_lobe_reuse",
+            }
+        )
         repeat_review = executive_repeat_review(
             message=req.message,
             topic=topic,
@@ -983,7 +1447,14 @@ async def chat(session_id: str, req: ChatRequest) -> dict[str, Any]:
             left_result=left_result,
             right_result=right_result,
             prior_times=prior_times,
+            embedding_matches=embedding_evidence["matches"],
+            embedding_threshold=float(embedding_evidence["threshold"]),
         )
+        repeat_review["embedding"] = {
+            key: embedding_evidence[key]
+            for key in ("available", "model", "threshold", "reason")
+        }
+        arbitration_plan = weighted_arbitration_plan(cognitive_priorities, left_result, right_result)
         user_turn_count = sum(1 for event in transcript if event.get("event_type") == "user_message")
         repeat_dynamics, _, _ = derive_repeat_dynamics(
             character=character,
@@ -1042,6 +1513,8 @@ async def chat(session_id: str, req: ChatRequest) -> dict[str, Any]:
             **common_context,
             "interaction": classification.model_dump(mode="json"),
             "conversation_dynamics": repeat_dynamics.model_dump(mode="json"),
+            "cognitive_priorities": cognitive_priorities,
+            "weighted_arbitration": arbitration_plan,
             "executive_repeat_review": repeat_review,
             "lobe_execution": lobe_execution,
             "repeat_deliberation": repeat_deliberation,
@@ -1165,6 +1638,8 @@ async def chat(session_id: str, req: ChatRequest) -> dict[str, Any]:
                 "interaction": classification.model_dump(mode="json"),
                 "repeat_review": repeat_review,
                 "lobe_execution": lobe_execution,
+                "cognitive_priorities": cognitive_priorities,
+                "weighted_arbitration": arbitration_plan,
             },
         )
         # Turn-level self-history is an infrastructure invariant, not a best-effort model suggestion.
@@ -1229,6 +1704,9 @@ async def chat(session_id: str, req: ChatRequest) -> dict[str, Any]:
                 "right": right_result,
                 "executive": executive,
                 "lobe_execution": lobe_execution,
+                "repeat_review": repeat_review,
+                "cognitive_priorities": cognitive_priorities,
+                "weighted_arbitration": arbitration_plan,
                 "timing_ms": {
                     "left": left_ms,
                     "right": right_ms,
@@ -1364,14 +1842,85 @@ async def _reflect(session_id: str) -> ReflectionResult:
         )
 
 
+async def process_deferred_reflections_once() -> dict[str, Any]:
+    """Lease and retry one failed close-time reflection, preserving close semantics."""
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        claimed = await post_json(
+            client,
+            f"{MEMORY_URL}/reflection-jobs/claim",
+            {"lease_seconds": REFLECTION_RETRY_LEASE_SECONDS},
+        )
+    job = claimed.get("job") if isinstance(claimed, dict) else None
+    if not isinstance(job, dict):
+        return {"processed": False, "reason": "no_due_reflection_job"}
+    session_id = str(job.get("session_id") or "")
+    if not session_id:
+        return {"processed": False, "reason": "invalid_reflection_job"}
+
+    try:
+        async with session_operation_lock(session_id):
+            async with asyncio.timeout(TURN_TIMEOUT_SECONDS):
+                reflection = await _reflect(session_id)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        async with httpx.AsyncClient(timeout=20) as client:
+            released = await post_json(
+                client,
+                f"{MEMORY_URL}/reflection-jobs/{session_id}/reschedule",
+                {"error": "Deferred reflection generation failed; retry scheduled."},
+            )
+        return {
+            "processed": True,
+            "status": "rescheduled",
+            "session_id": session_id,
+            "backoff_seconds": released.get("backoff_seconds"),
+        }
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        await post_json(client, f"{MEMORY_URL}/reflection-jobs/{session_id}/complete", {})
+    return {
+        "processed": True,
+        "status": "completed",
+        "session_id": session_id,
+        "summary": reflection.summary,
+    }
+
+
+async def _deferred_reflection_retry_loop() -> None:
+    """Run one durable retry at a time; a failed poll never kills the runtime."""
+
+    while True:
+        await asyncio.sleep(REFLECTION_RETRY_POLL_SECONDS)
+        try:
+            await process_deferred_reflections_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # The job remains pending or lease-expiry reclaimable in memory. Do
+            # not let an unavailable memory service stop later retries.
+            continue
+
+
 @app.post("/sessions/{session_id}/reflect", response_model=ReflectionResult)
 async def reflect(session_id: str) -> ReflectionResult:
     async with session_operation_lock(session_id):
         try:
             async with asyncio.timeout(TURN_TIMEOUT_SECONDS):
-                return await _reflect(session_id)
+                result = await _reflect(session_id)
         except TimeoutError as exc:
             raise HTTPException(504, "Reflection exceeded the response time limit.") from exc
+    async with httpx.AsyncClient(timeout=20) as client:
+        await post_json(client, f"{MEMORY_URL}/reflection-jobs/{session_id}/complete", {})
+    return result
+
+
+@app.post("/reflection-retries/run")
+async def run_deferred_reflection_retry() -> dict[str, Any]:
+    """Run one queued reflection immediately from the authenticated status UI."""
+
+    return await process_deferred_reflections_once()
 
 
 @app.post("/sessions/{session_id}/close")
@@ -1388,8 +1937,19 @@ async def close(session_id: str) -> dict[str, Any]:
             # A local model can be temporarily unable to produce a valid optional
             # reflection. The user's explicit close action must still release the
             # session lock and prevent more messages from being accepted.
-            reflection_warning = "The conversation closed, but its reflection could not be generated."
+            reflection_warning = "The conversation closed, and its reflection was queued for retry."
         async with httpx.AsyncClient(timeout=20) as client:
+            if reflection is None:
+                try:
+                    await post_json(
+                        client,
+                        f"{MEMORY_URL}/reflection-jobs/{session_id}/schedule",
+                        {"error": "Close-time reflection generation failed."},
+                    )
+                except HTTPException:
+                    reflection_warning = (
+                        "The conversation closed, but its reflection could not be generated or queued for retry."
+                    )
             closed = await post_json(client, f"{MEMORY_URL}/sessions/{session_id}/close", {})
         return {
             "session": closed,

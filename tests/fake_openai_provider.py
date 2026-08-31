@@ -17,7 +17,24 @@ app = FastAPI()
 
 @app.get("/v1/models")
 def models() -> dict[str, list[dict[str, str]]]:
-    return {"data": [{"id": "test-model"}]}
+    return {"data": [{"id": "test-model"}, {"id": "test-embed"}]}
+
+
+@app.post("/api/embed")
+def embed(body: dict[str, Any]) -> dict[str, Any]:
+    values = body.get("input", [])
+    if isinstance(values, str):
+        values = [values]
+
+    def vector(value: Any) -> list[float]:
+        text = str(value).lower()
+        if any(word in text for word in ("born", "hometown", "home", "from", "town")):
+            return [1.0, 0.0, 0.0]
+        if any(word in text for word in ("cargo", "shipment", "crate", "manifest")):
+            return [0.0, 1.0, 0.0]
+        return [0.0, 0.0, 1.0]
+
+    return {"model": body.get("model", "test-embed"), "embeddings": [vector(value) for value in values]}
 
 
 def _answer(request: dict[str, Any]) -> str | None:

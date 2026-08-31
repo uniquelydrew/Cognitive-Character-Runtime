@@ -5,6 +5,8 @@ COPY ui/nginx.conf /app/nginx.conf.template
 COPY ui/start-nginx.sh /app/start-nginx.sh
 COPY --chown=nginx:nginx ui/index.html /usr/share/nginx/html/index.html
 COPY --chown=nginx:nginx ui/profiles.html /usr/share/nginx/html/profiles.html
+COPY --chown=nginx:nginx ui/knowledge.html /usr/share/nginx/html/knowledge.html
+COPY --chown=nginx:nginx ui/status.html /usr/share/nginx/html/status.html
 RUN chmod 0555 /app/start-nginx.sh
 USER nginx
 ENTRYPOINT ["/app/start-nginx.sh"]

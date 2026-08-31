@@ -55,6 +55,8 @@ def _system_prompt(mode: str, output_model: type[ModelOutput], *, corrective_ret
         "left": (
             "You are the analytic hemisphere of a persistent fictional character. "
             "Identify relevant established facts, consistency constraints, causal implications, and a response action. "
+            "context.role_attention is the source-controlled attention allocation for this role; it affects "
+            "your bounded work budget but never allows facts outside authorized context. "
             "context.general_knowledge is the complete authorized general-knowledge view; do not infer or disclose "
             "facts outside it. "
             "Do not invent canonical facts or propose mutations."
@@ -62,6 +64,8 @@ def _system_prompt(mode: str, output_model: type[ModelOutput], *, corrective_ret
         "right": (
             "You are the associative and social hemisphere of a persistent fictional character. "
             "Assess affect, tone, subtext, associations, and social consequences. "
+            "context.role_attention is the source-controlled attention allocation for this role; it affects "
+            "your bounded work budget but never allows facts outside authorized context. "
             "context.general_knowledge is the complete authorized general-knowledge view; do not infer or disclose "
             "facts outside it. "
             "Do not invent canonical facts or propose mutations."
@@ -69,6 +73,9 @@ def _system_prompt(mode: str, output_model: type[ModelOutput], *, corrective_ret
         "executive": (
             "You are the executive function of a persistent fictional character. "
             "Arbitrate the supplied left and right analyses while maintaining continuity. "
+            "context.weighted_arbitration is an enforced, source-controlled plan: left constraints are always "
+            "binding, and when non-factual response choices conflict you must follow its primary_role and "
+            "primary_packet. Do not substitute your own weighting. "
             "Before speaking, inspect context.executive_repeat_review, which is prepared after both "
             "hemispheres finish. Treat semantic_repeat_candidate as a meaningful rephrased-repeat "
             "signal even when the wording differs. context.conversation_dynamics contains measured pressure "
@@ -191,6 +198,24 @@ def _uses_extended_repeat_budget(req: CognitiveRequest) -> bool:
         return True
     deliberation = req.context.get("repeat_deliberation", {})
     return isinstance(deliberation, dict) and bool(deliberation.get("enabled"))
+
+
+def _priority_token_budget(req: CognitiveRequest) -> int:
+    """Apply profile priority to lobe compute without starving either role."""
+
+    if ROLE not in {"left", "right"}:
+        return MODEL_MAX_TOKENS
+    attention = req.context.get("role_attention", {})
+    if not isinstance(attention, dict) or attention.get("role") != ROLE:
+        return MODEL_MAX_TOKENS
+    try:
+        multiplier = float(attention.get("attention_budget", 1.0))
+    except (TypeError, ValueError):
+        multiplier = 1.0
+    # A profile can prioritize one lobe, never switch the other one off. Compact
+    # artifacts remain reliable with this 80-token floor.
+    multiplier = max(0.5, min(1.5, multiplier))
+    return max(80, round(MODEL_MAX_TOKENS * multiplier))
 
 
 def _compact_items(value: Any, limit: int) -> list[str]:
@@ -434,7 +459,11 @@ async def _request_completion(
         ),
         # Every worker returns a small structured artifact. Bounding output avoids a
         # queued local-model request consuming the entire orchestration time budget.
-        "max_tokens": MODEL_REPEAT_MAX_TOKENS if extended_repeat_budget else MODEL_MAX_TOKENS,
+        "max_tokens": (
+            MODEL_REPEAT_MAX_TOKENS
+            if extended_repeat_budget
+            else _priority_token_budget(req)
+        ),
         "response_format": _json_response_format(),
     }
     try:

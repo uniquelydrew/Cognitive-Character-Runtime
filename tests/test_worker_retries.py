@@ -106,3 +106,18 @@ def test_worker_recovers_a_repeat_assessment_from_a_near_miss(monkeypatch: pytes
     assert result.primary_hypothesis == "wants_more_detail"
     assert result.response_mode == "new_angle"
     assert result.alternative_hypotheses == ["checking_consistency"]
+
+
+def test_lobe_priority_changes_the_enforced_generation_budget(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(worker, "ROLE", "left")
+    monkeypatch.setattr(worker, "MODEL_MAX_TOKENS", 160)
+
+    high = CognitiveRequest.model_construct(
+        context={"role_attention": {"role": "left", "attention_budget": 1.5}}
+    )
+    low = CognitiveRequest.model_construct(
+        context={"role_attention": {"role": "left", "attention_budget": 0.5}}
+    )
+
+    assert worker._priority_token_budget(high) == 240
+    assert worker._priority_token_budget(low) == 80

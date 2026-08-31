@@ -1,11 +1,14 @@
 from services.common import CharacterDocument
 from services.orchestrator.app import (
+    bounded_lobe_transcript,
     derive_repeat_dynamics,
     executive_repeat_review,
     immediate_repeat_lobe_reuse,
     repeat_intent_fallback,
+    resolve_cognitive_priorities,
     response_substantially_repeats_prior_answer,
     response_substantially_repeats_recent_answers,
+    weighted_arbitration_plan,
 )
 
 
@@ -231,6 +234,77 @@ def test_executive_review_ignores_a_prior_user_turn_without_a_reply():
     )
 
     assert review["semantic_repeat_candidate"] is False
+
+
+def test_embedding_similarity_identifies_a_nonlexical_rephrased_repeat():
+    review = executive_repeat_review(
+        message="Which city was her early home?",
+        topic="topic.early.home",
+        current_event_id="evt_current",
+        session_events=[
+            {
+                "id": "evt_previous",
+                "event_type": "user_message",
+                "content": "Where was she born?",
+                "topic": "topic.birth.question",
+                "metadata": {},
+            },
+            {
+                "id": "evt_reply",
+                "event_type": "character_message",
+                "content": "She was born in Greyhaven.",
+                "topic": "topic.birth.question",
+                "metadata": {"responds_to": "evt_previous", "left": {}, "right": {}},
+            },
+            {
+                "id": "evt_current",
+                "event_type": "user_message",
+                "content": "Which city was her early home?",
+                "topic": "topic.early.home",
+                "metadata": {},
+            },
+        ],
+        left_result={"topic": "topic.early.home"},
+        right_result={"association_keys": []},
+        prior_times=0,
+        embedding_matches={"evt_previous": 0.91},
+        embedding_threshold=0.80,
+    )
+
+    assert review["semantic_repeat_candidate"] is True
+    assert review["reason"] == "embedding similarity"
+    assert review["embedding_similarity"] == 0.91
+
+
+def test_bounded_lobe_transcript_keeps_recent_raw_turns_under_hard_limits(monkeypatch):
+    monkeypatch.setattr("services.orchestrator.app.MAX_LOBE_TRANSCRIPT_EVENTS", 2)
+    monkeypatch.setattr("services.orchestrator.app.MAX_LOBE_TRANSCRIPT_CHARS", 15)
+    monkeypatch.setattr("services.orchestrator.app.MAX_LOBE_TRANSCRIPT_EVENT_CHARS", 12)
+    transcript = bounded_lobe_transcript([
+        {"id": "old", "event_type": "user_message", "actor": "user", "content": "old context", "topic": "old"},
+        {"id": "question", "event_type": "user_message", "actor": "user", "content": "recent question", "topic": "new"},
+        {"id": "reply", "event_type": "character_message", "actor": "character", "content": "recent answer", "topic": "new"},
+    ])
+
+    assert [event["event_id"] for event in transcript] == ["question", "reply"]
+    assert sum(len(event["content"]) for event in transcript) <= 15
+    assert transcript[-1]["content_truncated"] is True
+
+
+def test_profile_priorities_drive_a_bounded_arbitration_plan():
+    character = CHARACTER.model_copy(update={"cognition": {"left_weight": 3, "right_weight": 1}})
+    priorities = resolve_cognitive_priorities(character)
+    plan = weighted_arbitration_plan(
+        priorities,
+        {"action": "answer", "fact_refs": ["identity.birthplace"], "constraints": ["preserve_core"]},
+        {"action": "reassure", "tone": "warm", "risk": "low", "association_keys": ["home"]},
+    )
+
+    assert priorities["left_weight"] == 0.75
+    assert priorities["right_weight"] == 0.25
+    assert priorities["primary_role"] == "left"
+    assert plan["primary_packet"] == plan["left"]
+    assert "left.constraints are binding" in plan["binding_rules"][0]
 
 
 def test_immediate_answered_exact_repeat_reuses_prior_lobe_artifacts():

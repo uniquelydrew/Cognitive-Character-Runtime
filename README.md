@@ -15,7 +15,8 @@ The repository currently implements:
 - Docker Compose bridge network.
 - One stateless cognitive-worker container per cognitive role.
 - Parallel Left/Right inference.
-- Executive arbitration after both hemispheres return.
+- Source-controlled Left/Right priorities that enforce lobe attention budgets and
+  an auditable Executive arbitration plan after both hemispheres return.
 - Character primers loaded from YAML.
 - Character switching in a browser UI.
 - A separate Profile Studio for creating, viewing, editing, importing, and
@@ -24,14 +25,17 @@ The repository currently implements:
   before a restore.
 - A separate source-controlled, hierarchical general-knowledge corpus with
   label-indexed retrieval and character-derived access subsets.
+- Knowledge Studio for viewing, validating, importing, exporting, and editing
+  the complete general-knowledge catalog as YAML.
 - Persistent SQLite event/memory store using WAL mode.
 - Append-only raw interaction history.
 - Explicit self-history of character statements.
 - Detection of repeated questions within the active interaction.
 - Recognition of several paraphrases as one semantic topic in the bootstrap resolver.
-- Repeated-question context supplied explicitly to all three live cognitive roles.
+- Bounded raw recent-session transcripts supplied explicitly to all three live cognitive roles.
 - A post-lobe executive repeat review that can recognize rephrased repeats from shared
-  analysis subjects or fact anchors, even when the initial topic keys differ.
+  analysis subjects, fact anchors, or a compact embedding comparison, even when the
+  initial topic keys differ.
 - Conversation-level patience plus audited, subject-specific defensiveness, with a
   deterministic confused/defensive delivery guard when a local model ignores the
   executive's tone instruction.
@@ -39,6 +43,8 @@ The repository currently implements:
 - Reflection retrieval of earlier interactions on the same resolved topic.
 - Persistent event-to-event `revisits` links.
 - Reflection idempotency until new conversational events occur.
+- Durable deferred reflection jobs: a failed close-time reflection is leased and
+  retried with exponential backoff after the conversation closes.
 - Mutation policy validation.
 - Immutable runtime core identity/biography.
 - Evidence requirements for belief and mutable-state revisions.
@@ -48,6 +54,8 @@ The repository currently implements:
 - An Ollama local-model service, with an initialization service that pulls the configured model before workers start.
 - OpenAI-compatible JSON-mode model calls with per-role, mode-specific contracts and server-side Pydantic validation.
 - Model-aware worker readiness checks: a worker is healthy only after its configured model is available.
+- Runtime Monitor for per-role health, model latency, effective character priority,
+  semantic-repeat readiness, and reflection retry state.
 - Loopback-only public ports, an authenticated API proxy, no permissive CORS,
   disabled-by-default debug routes, and bounded request/turn execution.
 
@@ -133,6 +141,12 @@ artifacts against the bounded recent event stream. It produces a repeat candidat
 an inherited semantic subject key, and an interaction posture. This lets the lobes
 reason freely while making repeat detection an explicit executive responsibility.
 
+Every fresh lobe request includes the most recent raw user/character events, capped
+by both event count and character count (`MAX_LOBE_TRANSCRIPT_EVENTS`,
+`MAX_LOBE_TRANSCRIPT_CHARS`, and `MAX_LOBE_TRANSCRIPT_EVENT_CHARS`). The current
+user message remains a separate request field. This preserves literal conversation
+continuity without letting an old session grow model context indefinitely.
+
 ## Reflection lifecycle
 
 Reflection is a separate Executive mode and normally occurs when an interaction is ended.
@@ -170,6 +184,11 @@ policy validator
 The invariant is:
 
 > Reflection may reinterpret and build on history, but it does not silently rewrite raw history.
+
+If close-time reflection fails, the session still closes immediately. The memory
+service records a durable `reflection_jobs` entry, and the orchestrator later leases
+and retries it with bounded exponential backoff. A late retry may append only its
+reflection event to a closed session; new user or character messages remain rejected.
 
 ## Memory categories
 
@@ -356,6 +375,18 @@ Profile Studio is available at:
 http://localhost:3000/profiles.html
 ```
 
+Knowledge Studio is available at:
+
+```text
+http://localhost:3000/knowledge.html
+```
+
+Runtime Monitor is available at:
+
+```text
+http://localhost:3000/status.html
+```
+
 The orchestrator API is exposed separately at:
 
 ```text
@@ -410,6 +441,17 @@ Adding another YAML file creates another selectable character after the memory s
 
 Existing mutable state is not reset when the primer is reloaded.
 
+### Cognitive role priorities
+
+`cognition.left_weight` and `cognition.right_weight` are normalized on every
+turn. They do not permit the Right role to override factual constraints: Left
+constraints remain binding. Instead, the weights control each lobe's bounded
+generation attention budget and create a stored Executive arbitration plan. When
+non-factual delivery choices conflict, the plan selects the higher-weight role's
+packet; equal or near-equal weights choose a balanced packet. The resulting
+`cognitive_priorities` and `weighted_arbitration` are retained with the character
+event and returned in `cognition` for audit.
+
 ## Profile Studio and source of truth
 
 Profile Studio edits the canonical YAML file in `characters/` and immediately
@@ -441,9 +483,9 @@ stores rather than leaving a mixed primer/runtime state.
 ## General knowledge and classification hierarchy
 
 General knowledge is not stored as a recent event or a character memory. It is a
-source-controlled corpus under `knowledge/`, organized by classification nodes
-and indexed by those labels. A node may inherit from one or more parent nodes;
-the loader rejects unknown parents and cycles.
+catalog under `knowledge/`, organized by classification nodes and indexed by
+those labels. A node may inherit from one or more parent nodes; the loader and
+Knowledge Studio reject unknown parents and cycles.
 
 Each knowledge record has retrieval labels plus an access rule:
 
@@ -454,7 +496,14 @@ access:
   require_all: [community.port_staff]
 assertions:
   - Staff reconcile manifests with berth logs.
+epistemic_type: canon_policy
 ```
+
+`epistemic_type` on a general-knowledge record is a bounded, lower-case
+setting label, not the closed runtime-memory enum. It can therefore preserve
+categories such as `canon_policy`, `contested_principle`, `historical_fact`, or
+`provisional_model`. Runtime memories and mutations continue to use the
+separate, fixed epistemic-type enum above.
 
 At turn time, the runtime resolves only taxonomy aliases in the user’s message,
 uses the label index to select candidates, derives a character’s label closure
@@ -463,6 +512,24 @@ then applies `require_all` / `require_any`. Only the allowed subset is included
 in cognitive-worker context. The model never receives denied records or the full
 corpus. Recent events and memories can affect interpretation, but cannot mutate
 or grant this general-knowledge source.
+
+### Knowledge Studio, catalog import, and schema sample
+
+`knowledge/northbridge_port.yaml` is the starter corpus. The first save or
+import from Knowledge Studio writes `knowledge/catalog.yaml`; that managed file
+then becomes the single authoritative source and takes precedence over bundled
+starter files. `knowledge/catalog.example.yaml` is a complete valid schema
+example that is intentionally ignored by the loader. It provides the shape for
+classification IDs, parents/aliases, record retrieval labels, access rules,
+assertions, epistemic categories, confidence, and source metadata.
+
+Knowledge Studio downloads the exact active catalog, lets an author validate a
+full YAML replacement without changing runtime state, and imports or saves only
+after the hierarchy and Pydantic schema pass. A successful write atomically
+replaces both `catalog.yaml` and the SQLite label index; a failed validation or
+write preserves the previously active source and index. The authenticated
+management API is the only in-container writer for that mounted catalog. A
+conversation, reflection, or cognitive worker has no endpoint to edit it.
 
 ## Repeated-question continuity
 
@@ -520,6 +587,14 @@ Rephrases still use fresh lobe analysis so the Executive can detect non-exact se
 repetition safely. `cognition.timing_ms` reports the Executive assessment and any
 revision separately.
 
+For fresh lobe turns, the post-lobe review also batches the current question and up
+to `SEMANTIC_REPEAT_MAX_CANDIDATES` earlier answered questions through Ollama's
+compact `OLLAMA_EMBED_MODEL` (default `all-minilm`) embedding endpoint. Cosine
+similarity at or above `SEMANTIC_REPEAT_SIMILARITY_THRESHOLD` (default `0.80`) is
+recorded as embedding evidence for the Executive. If that optional call is down,
+the turn continues with the existing lexical and lobe-artifact checks; it never
+silently invents a repeat match.
+
 The deterministic topic resolver is intentionally temporary. It is not used for
 general-knowledge retrieval: that path is taxonomy-label indexed.
 
@@ -535,6 +610,7 @@ Each role can independently target another provider through these `.env` variabl
 
 ```text
 OLLAMA_MODEL
+OLLAMA_EMBED_MODEL
 LEFT_MODEL_BASE_URL    LEFT_MODEL_NAME    LEFT_MODEL_API_KEY    LEFT_MODEL_TIMEOUT_SECONDS    LEFT_MODEL_MAX_TOKENS    LEFT_MODEL_OUTPUT_ATTEMPTS
 RIGHT_MODEL_BASE_URL   RIGHT_MODEL_NAME   RIGHT_MODEL_API_KEY   RIGHT_MODEL_TIMEOUT_SECONDS   RIGHT_MODEL_MAX_TOKENS   RIGHT_MODEL_OUTPUT_ATTEMPTS
 EXEC_MODEL_BASE_URL    EXEC_MODEL_NAME    EXEC_MODEL_API_KEY    EXEC_MODEL_TIMEOUT_SECONDS    EXEC_MODEL_MAX_TOKENS    EXEC_MODEL_OUTPUT_ATTEMPTS
@@ -549,7 +625,8 @@ docker compose -f docker-compose.yml -f docker-compose.dedicated-providers.yml u
 It starts `ollama-left`, `ollama-right`, and `ollama-executive`, reserves NVIDIA GPU access for them, and repoints the three worker containers to their matching provider. It removes the shared scheduler choke point, but can load three copies of the model, so it needs enough available GPU memory. The API includes `cognition.timing_ms` on every chat turn to compare the lobe critical path and executive time between topologies. Confirm the active processor with `docker compose exec ollama-left ollama ps`; a CPU report means provider splitting will usually be slower, not faster.
 
 In dedicated mode the base Ollama service is retained only for the one-time model
-pull; it has no GPU reservation and keeps no model resident after bootstrap.
+pull and the compact repeat embedding call; it has no GPU reservation and keeps no
+language model resident after bootstrap.
 
 The workers request documented OpenAI-compatible JSON mode and validate the returned JSON before returning it to the orchestrator. The accepted contracts are intentionally different for each task:
 
@@ -570,6 +647,7 @@ If a provider is unreachable, the model is missing, or its output violates the c
 
 ```text
 GET  /health
+GET  /status?character_id={optional_character_id}
 GET  /characters
 GET  /characters/{character_id}/state
 GET  /profiles
@@ -584,6 +662,7 @@ GET  /sessions/{session_id}/events
 POST /sessions/{session_id}/chat
 POST /sessions/{session_id}/reflect
 POST /sessions/{session_id}/close
+POST /reflection-retries/run
 GET  /debug/{character_id}  # only when ENABLE_DEBUG_API=true
 ```
 
@@ -627,7 +706,7 @@ core mutation policy rejects runtime biography changes
 Current result:
 
 ```text
-36 passed
+50 passed
 ```
 
 ## Deliberately deferred
@@ -635,7 +714,7 @@ Current result:
 The MVP does not yet implement:
 
 ```text
-embedding/vector retrieval
+embedding/vector retrieval for the general-knowledge corpus
 learned semantic topic resolution
 full causal contradiction detection
 belief extraction from arbitrary dialogue

@@ -36,6 +36,15 @@ services:
       TURN_TIMEOUT_SECONDS: ${TURN_TIMEOUT_SECONDS:-240}
       SESSION_QUEUE_TIMEOUT_SECONDS: ${SESSION_QUEUE_TIMEOUT_SECONDS:-15}
       MAX_CONCURRENT_TURNS: ${MAX_CONCURRENT_TURNS:-2}
+      MAX_LOBE_TRANSCRIPT_EVENTS: ${MAX_LOBE_TRANSCRIPT_EVENTS:-10}
+      MAX_LOBE_TRANSCRIPT_CHARS: ${MAX_LOBE_TRANSCRIPT_CHARS:-6000}
+      MAX_LOBE_TRANSCRIPT_EVENT_CHARS: ${MAX_LOBE_TRANSCRIPT_EVENT_CHARS:-1200}
+      SEMANTIC_EMBEDDING_URL: ${SEMANTIC_EMBEDDING_URL:-http://ollama:11434/api/embed}
+      SEMANTIC_EMBEDDING_MODEL: ${SEMANTIC_EMBEDDING_MODEL:-${OLLAMA_EMBED_MODEL:-all-minilm}}
+      SEMANTIC_EMBEDDING_TIMEOUT_SECONDS: ${SEMANTIC_EMBEDDING_TIMEOUT_SECONDS:-8}
+      SEMANTIC_REPEAT_SIMILARITY_THRESHOLD: ${SEMANTIC_REPEAT_SIMILARITY_THRESHOLD:-0.80}
+      SEMANTIC_REPEAT_MAX_CANDIDATES: ${SEMANTIC_REPEAT_MAX_CANDIDATES:-12}
+      REFLECTION_RETRY_POLL_SECONDS: ${REFLECTION_RETRY_POLL_SECONDS:-30}
       ENABLE_DEBUG_API: ${ENABLE_DEBUG_API:-false}
     ports:
       - "127.0.0.1:8080:8000"
@@ -73,9 +82,10 @@ services:
       # Profile Studio persists validated primers here. Runtime conversation state
       # remains in the separate cognition-data volume.
       - ./characters:/characters
-      # General knowledge is a separate, source-controlled corpus. The runtime
-      # can read it but cannot rewrite it from conversation or model output.
-      - ./knowledge:/knowledge:ro
+      # General knowledge remains separate from conversation state. Only the
+      # authenticated Knowledge Studio routes can write its validated catalog;
+      # cognitive workers and model output never receive a write path.
+      - ./knowledge:/knowledge
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=64m
@@ -108,7 +118,10 @@ services:
     environment:
       OLLAMA_HOST: http://ollama:11434
       OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.2:3b}
-    entrypoint: ["/bin/sh", "-c", "ollama pull \"$$OLLAMA_MODEL\""]
+      # The compact embedding model is used only for bounded non-exact repeat
+      # checks. It is not part of a character's general-knowledge corpus.
+      OLLAMA_EMBED_MODEL: ${OLLAMA_EMBED_MODEL:-all-minilm}
+    entrypoint: ["/bin/sh", "-ec", "ollama pull \"$$OLLAMA_MODEL\"; ollama pull \"$$OLLAMA_EMBED_MODEL\""]
     depends_on:
       ollama:
         condition: service_healthy
