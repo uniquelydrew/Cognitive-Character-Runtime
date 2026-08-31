@@ -9,7 +9,26 @@ from __future__ import annotations
 
 from typing import Any
 
+from services.common import InteractionClassification
 from services.orchestrator.history_matching import answered_turns, history_report, match_history
+
+
+def neutral_interaction_classification(**kwargs: Any) -> InteractionClassification:
+    """Prevent pre-cognition topic equality from declaring a repeat.
+
+    The legacy route still computes ``prior_times`` from provisional topic labels.
+    Those values remain useful as telemetry during migration but are not permitted
+    to establish historical relatedness. Only the post-lobe matcher may upgrade
+    the classification after evidence has been collected.
+    """
+
+    return InteractionClassification(
+        interaction_type="new_subject",
+        topic=kwargs.get("topic"),
+        prior_answer=None,
+        times_asked=1,
+        related_event_ids=[],
+    )
 
 
 def _recent_turns(events: list[dict[str, Any]], current_event_id: str) -> list[dict[str, Any]]:
@@ -52,11 +71,13 @@ def evidence_history_review(
 ) -> dict[str, Any]:
     """Translate a ``HistoryMatch`` into the legacy Executive review shape.
 
-    ``topic`` and ``prior_times`` remain in the signature only because the current
-    route still supplies them. They are explicitly excluded from match evidence.
+    ``prior_times`` remains in the signature only because the current route still
+    supplies it. It is explicitly excluded from match evidence. ``topic`` may be
+    retained as an output label for an exact-text repeat, but never contributes to
+    candidate selection.
     """
 
-    del topic, prior_times
+    del prior_times
     prior = answered_turns(session_events, current_user_event_id=current_event_id)
     match = match_history(
         message=message,
@@ -95,7 +116,8 @@ def evidence_history_review(
         except ValueError:
             embedding_similarity = None
 
-    subject_key = match.subject_hint or f"thread:{match.root_user_event_id}"
+    exact_repeat = any(signal.kind == "exact_text" for signal in match.signals)
+    subject_key = topic if exact_repeat else (match.subject_hint or f"thread:{match.root_user_event_id}")
     return {
         "semantic_repeat_candidate": True,
         "subject_key": subject_key,
