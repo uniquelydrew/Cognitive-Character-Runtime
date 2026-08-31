@@ -46,6 +46,9 @@ services:
       SEMANTIC_REPEAT_MAX_CANDIDATES: ${SEMANTIC_REPEAT_MAX_CANDIDATES:-12}
       REFLECTION_RETRY_POLL_SECONDS: ${REFLECTION_RETRY_POLL_SECONDS:-30}
       ENABLE_DEBUG_API: ${ENABLE_DEBUG_API:-false}
+      # Benchmark-only control: compare Executive-only runs with the normal
+      # Left/Right/Executive pipeline using the same scenarios and provider.
+      EXECUTIVE_ONLY_CONTROL: ${EXECUTIVE_ONLY_CONTROL:-false}
     ports:
       - "127.0.0.1:8080:8000"
     read_only: true

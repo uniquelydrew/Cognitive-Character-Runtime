@@ -107,6 +107,22 @@ committed; accepted claims are written to `executive_claim_audit` alongside the
 reply. SQLite startup applies versioned migrations and enforces cross-character
 event/session/link constraints with foreign keys and triggers.
 
+## Measuring the multi-perspective design
+
+The repository includes a paired evaluator for the original architecture
+question. Run a fixed scenario set against the normal Left/Right/Executive
+deployment and an Executive-only control, save results with stable `id`,
+`expected`, and response fields, then run:
+
+```text
+python -m services.evaluation --multi multi.json --control control.json
+```
+
+It reports paired correctness deltas, wins/losses/ties, and claim-verification
+counts. It intentionally measures observable responses rather than hidden model
+reasoning; a conclusion requires a representative scenario set and repeated
+runs, not one favorable conversation.
+
 ## Interaction lifecycle
 
 ```text

@@ -33,6 +33,7 @@ from services.common import (
 from services.orchestrator.claims import claim_evidence_catalog, verify_factual_claims
 from services.orchestrator.locking import SessionLockRegistry
 from services.orchestrator.relationships import historical_relationships, merge_historical_relationships
+from services.orchestrator.transport import get_json, get_text, post_json, put_json
 
 MEMORY_URL = os.getenv("MEMORY_URL", "http://memory:8000").rstrip("/")
 LEFT_URL = os.getenv("LEFT_URL", "http://left-model:8000").rstrip("/")
@@ -53,6 +54,7 @@ SEMANTIC_REPEAT_MAX_CANDIDATES = int(os.getenv("SEMANTIC_REPEAT_MAX_CANDIDATES",
 REFLECTION_RETRY_POLL_SECONDS = float(os.getenv("REFLECTION_RETRY_POLL_SECONDS", "30"))
 REFLECTION_RETRY_LEASE_SECONDS = int(os.getenv("REFLECTION_RETRY_LEASE_SECONDS", "300"))
 DEBUG_API_ENABLED = os.getenv("ENABLE_DEBUG_API", "").lower() in {"1", "true", "yes"}
+EXECUTIVE_ONLY_CONTROL = os.getenv("EXECUTIVE_ONLY_CONTROL", "").lower() in {"1", "true", "yes"}
 API_AUTH_TOKEN = os.getenv("API_AUTH_TOKEN", "")
 CONTENT_TOKEN_RE = re.compile(r"[a-z0-9']+")
 CONTENT_STOP_WORDS = {
@@ -874,67 +876,6 @@ def derive_repeat_dynamics(
     )
 
 
-async def get_json(client: httpx.AsyncClient, url: str) -> Any:
-    try:
-        r = await client.get(url)
-    except httpx.TimeoutException as exc:
-        raise HTTPException(504, "A required service did not respond in time. Please retry.") from exc
-    except httpx.RequestError as exc:
-        raise HTTPException(503, "A required service is unavailable. Please retry shortly.") from exc
-    if r.status_code >= 400:
-        raise HTTPException(r.status_code, _upstream_detail(r))
-    return r.json()
-
-
-async def post_json(client: httpx.AsyncClient, url: str, payload: Any) -> Any:
-    try:
-        r = await client.post(url, json=payload)
-    except httpx.TimeoutException as exc:
-        raise HTTPException(504, "The character is taking longer than expected. Please retry.") from exc
-    except httpx.RequestError as exc:
-        raise HTTPException(503, "A required service is unavailable. Please retry shortly.") from exc
-    if r.status_code >= 400:
-        raise HTTPException(r.status_code, _upstream_detail(r))
-    return r.json()
-
-
-async def put_json(client: httpx.AsyncClient, url: str, payload: Any) -> Any:
-    try:
-        r = await client.put(url, json=payload)
-    except httpx.TimeoutException as exc:
-        raise HTTPException(504, "The update took too long. Please retry.") from exc
-    except httpx.RequestError as exc:
-        raise HTTPException(503, "A required service is unavailable. Please retry shortly.") from exc
-    if r.status_code >= 400:
-        raise HTTPException(r.status_code, _upstream_detail(r))
-    return r.json()
-
-
-async def get_text(client: httpx.AsyncClient, url: str) -> httpx.Response:
-    try:
-        response = await client.get(url)
-    except httpx.TimeoutException as exc:
-        raise HTTPException(504, "The export took too long. Please retry.") from exc
-    except httpx.RequestError as exc:
-        raise HTTPException(503, "The export service is unavailable. Please retry shortly.") from exc
-    if response.status_code >= 400:
-        raise HTTPException(response.status_code, _upstream_detail(response))
-    return response
-
-
-def _upstream_detail(response: httpx.Response) -> str:
-    """Preserve a worker's safe error message instead of leaking JSON as a string."""
-
-    try:
-        payload = response.json()
-        detail = payload.get("detail") if isinstance(payload, dict) else None
-        if isinstance(detail, str) and detail:
-            return detail
-    except (ValueError, TypeError):
-        pass
-    return response.text or "The request could not be completed."
-
-
 async def load_character(client: httpx.AsyncClient, character_id: str) -> tuple[CharacterDocument, dict[str, Any]]:
     state = await get_json(client, f"{MEMORY_URL}/characters/{character_id}")
     char_payload = dict(state["character"])
@@ -1379,7 +1320,16 @@ async def chat(session_id: str, req: ChatRequest) -> dict[str, Any]:
             transcript=lobe_transcript,
         )
 
-        if lobe_reuse:
+        if EXECUTIVE_ONLY_CONTROL:
+            # Benchmark control: preserve the Executive prompt and all
+            # retrieval/state inputs while withholding independent lobe
+            # analyses. This makes a paired comparison attributable to the
+            # multi-perspective pipeline rather than different knowledge.
+            left_result = {"topic": topic, "fact_refs": [], "constraints": [], "action": "control"}
+            right_result = {"action": "control", "affect": {}, "tone": "neutral", "risk": "unknown", "association_keys": []}
+            left_ms = right_ms = 0
+            lobe_execution = {"mode": "executive_only_control", "transcript_events": len(lobe_transcript)}
+        elif lobe_reuse:
             left_result = dict(lobe_reuse["left"])
             right_result = dict(lobe_reuse["right"])
             left_ms = right_ms = 0
