@@ -19,13 +19,15 @@ services:
           devices: !override []
 
   ollama-left:
-    image: ollama/ollama@sha256:020e4134285e2ef4d8fd801234176de3b4faadc992a3eb06c8e66a2f9d4c4ba2
+    build:
+      context: .
+      dockerfile: services/ollama/Dockerfile
     environment:
       OLLAMA_KEEP_ALIVE: ${DEDICATED_OLLAMA_KEEP_ALIVE:-10m}
       OLLAMA_NUM_PARALLEL: "1"
       OLLAMA_MAX_LOADED_MODELS: "1"
     volumes:
-      - ollama-models:/root/.ollama
+      - ollama-models:/home/ollama/.ollama
     deploy:
       resources:
         reservations:
@@ -45,13 +47,15 @@ services:
     networks: [cognition]
 
   ollama-right:
-    image: ollama/ollama@sha256:020e4134285e2ef4d8fd801234176de3b4faadc992a3eb06c8e66a2f9d4c4ba2
+    build:
+      context: .
+      dockerfile: services/ollama/Dockerfile
     environment:
       OLLAMA_KEEP_ALIVE: ${DEDICATED_OLLAMA_KEEP_ALIVE:-10m}
       OLLAMA_NUM_PARALLEL: "1"
       OLLAMA_MAX_LOADED_MODELS: "1"
     volumes:
-      - ollama-models:/root/.ollama
+      - ollama-models:/home/ollama/.ollama
     deploy:
       resources:
         reservations:
@@ -71,13 +75,15 @@ services:
     networks: [cognition]
 
   ollama-executive:
-    image: ollama/ollama@sha256:020e4134285e2ef4d8fd801234176de3b4faadc992a3eb06c8e66a2f9d4c4ba2
+    build:
+      context: .
+      dockerfile: services/ollama/Dockerfile
     environment:
       OLLAMA_KEEP_ALIVE: ${DEDICATED_OLLAMA_KEEP_ALIVE:-10m}
       OLLAMA_NUM_PARALLEL: "1"
       OLLAMA_MAX_LOADED_MODELS: "1"
     volumes:
-      - ollama-models:/root/.ollama
+      - ollama-models:/home/ollama/.ollama
     deploy:
       resources:
         reservations:

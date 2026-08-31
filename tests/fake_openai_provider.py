@@ -93,6 +93,10 @@ def completions(body: dict[str, Any]) -> dict[str, Any]:
             "speech": speech,
             "topic": interaction.get("topic", "topic.general"),
             "repeat_escalation": "hold",
+            "factual_claims": ([{
+                "text": answer,
+                "evidence_refs": ["identity.birthplace"] if "birthplace" in identity and answer == str(identity["birthplace"]) else [],
+            }] if answer != "I do not have enough established information." else []),
             "mutations": [],
             "memory_writes": [{
                 "kind": "self_history",

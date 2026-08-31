@@ -93,6 +93,8 @@ def _system_prompt(mode: str, output_model: type[ModelOutput], *, corrective_ret
             "echoing the answer; make a meaningfully different response now. "
             "This is not permission to change facts. "
             "Use only supplied character data, memories, and context.general_knowledge as established facts. "
+            "For every factual assertion in speech, emit a factual_claims item with the exact supporting "
+            "context.claim_evidence key. Do not make a factual assertion if no authorized citation exists. "
             "Never rewrite raw history or immutable core biography. Any state change must be a typed, "
             "evidence-backed mutation proposal."
         ),
@@ -165,6 +167,7 @@ def _output_example(output_model: type[ModelOutput]) -> str:
             "speech": "The character's spoken response as a plain string.",
             "topic": "stable topic identifier",
             "repeat_escalation": "hold",
+            "factual_claims": [{"text": "I was born in Northbridge.", "evidence_refs": ["identity.birthplace"]}],
             "mutations": [],
             "memory_writes": [],
         },

@@ -28,6 +28,7 @@ from services.common import (
     MutationProposal,
     ValidatedMutation,
 )
+from services.memory.migrations import apply_migrations
 
 DB_PATH = Path(os.getenv("MEMORY_DATABASE", "/data/cognition.db"))
 CHARACTER_DIR = Path(os.getenv("CHARACTER_DIR", "/characters"))
@@ -444,6 +445,7 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_knowledge_record_labels_label ON knowledge_record_labels(label_id, record_id);
             """
         )
+        apply_migrations(conn)
 
 
 def load_character_files() -> None:
@@ -2178,6 +2180,16 @@ def commit_turn(session_id: str, turn: TurnCommit) -> dict[str, Any]:
         if not user_event:
             raise HTTPException(422, "The character message must answer a recorded user event in this session.")
         stored_event = _add_event(event, conn)
+        claim_audit = metadata.get("claim_verification", [])
+        if not isinstance(claim_audit, list):
+            raise HTTPException(422, "Character event claim verification must be a list.")
+        for claim in claim_audit:
+            if not isinstance(claim, dict) or claim.get("status") != "verified":
+                raise HTTPException(422, "Only verified Executive claims may be committed.")
+            conn.execute(
+                "INSERT INTO executive_claim_audit VALUES (?, ?, ?, ?, 'verified', ?)",
+                (f"claim_{uuid.uuid4().hex}", stored_event.id, event.character_id, json.dumps(claim), now_iso()),
+            )
         stored_memories = [_add_memory(memory, conn) for memory in turn.memories]
         mutation_results = _apply_mutations(event.character_id, MutationBatch(proposals=turn.proposals), conn)
     return {

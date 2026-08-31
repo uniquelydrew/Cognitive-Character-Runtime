@@ -93,6 +93,20 @@ The repository currently implements:
 
 The browser never talks directly to a model worker. Model workers never directly access persistent storage.
 
+## Runtime safety assumptions
+
+The orchestrator's per-session turn lock is intentionally process-local and is
+reference-counted so completed sessions do not accumulate locks. Run one
+orchestrator replica for each SQLite memory database. Horizontal orchestrator
+scaling requires replacing this local lock with a database-backed lease.
+
+Executive turns carry an explicit `factual_claims` list. Each claim must cite a
+stable key from the authorized `claim_evidence` catalog (identity, established
+belief, or permitted knowledge). Unknown citations reject the turn before it is
+committed; accepted claims are written to `executive_claim_audit` alongside the
+reply. SQLite startup applies versioned migrations and enforces cross-character
+event/session/link constraints with foreign keys and triggers.
+
 ## Interaction lifecycle
 
 ```text

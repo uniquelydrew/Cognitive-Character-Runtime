@@ -100,9 +100,11 @@ services:
 
   # Ollama is the live local-model provider. Model weights persist in a named volume.
   ollama:
-    image: ollama/ollama@sha256:020e4134285e2ef4d8fd801234176de3b4faadc992a3eb06c8e66a2f9d4c4ba2
+    build:
+      context: .
+      dockerfile: services/ollama/Dockerfile
     volumes:
-      - ollama-models:/root/.ollama
+      - ollama-models:/home/ollama/.ollama
     healthcheck:
       test: ["CMD-SHELL", "ollama list >/dev/null 2>&1"]
       interval: 5s
@@ -114,7 +116,9 @@ services:
   # Pull once before any cognitive worker declares itself ready. Override OLLAMA_MODEL
   # in .env to select another locally supported instruct model.
   ollama-init:
-    image: ollama/ollama@sha256:020e4134285e2ef4d8fd801234176de3b4faadc992a3eb06c8e66a2f9d4c4ba2
+    build:
+      context: .
+      dockerfile: services/ollama/Dockerfile
     environment:
       OLLAMA_HOST: http://ollama:11434
       OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.2:3b}

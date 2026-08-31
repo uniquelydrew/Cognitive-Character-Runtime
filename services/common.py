@@ -262,6 +262,17 @@ class MemoryWrite(ModelOutput):
     salience: float = Field(ge=0.0, le=1.0)
 
 
+class ExecutiveClaim(ModelOutput):
+    """An externally auditable factual assertion in an Executive response.
+
+    ``evidence_refs`` are stable references from ``context.claim_evidence``;
+    free-form citations are intentionally not accepted.
+    """
+
+    text: str = Field(min_length=1, max_length=1_000)
+    evidence_refs: list[str] = Field(min_length=1, max_length=12)
+
+
 class ExecutiveTurn(ModelOutput):
     goal: str = Field(min_length=1, max_length=500)
     strategy: str = Field(min_length=1, max_length=500)
@@ -270,6 +281,7 @@ class ExecutiveTurn(ModelOutput):
     # Repeat pressure is evidence, not an automatic emotional reaction. The
     # executive decides whether this turn should alter durable defensiveness.
     repeat_escalation: Literal["hold", "increase", "deescalate"] = "hold"
+    factual_claims: list[ExecutiveClaim] = Field(default_factory=list, max_length=12)
     mutations: list[MutationProposal] = Field(default_factory=list, max_length=20)
     memory_writes: list[MemoryWrite] = Field(default_factory=list, max_length=10)
 

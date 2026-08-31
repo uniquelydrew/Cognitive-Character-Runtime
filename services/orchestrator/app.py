@@ -30,6 +30,9 @@ from services.common import (
     MutationProposal,
     RepeatDynamics,
 )
+from services.orchestrator.claims import claim_evidence_catalog, verify_factual_claims
+from services.orchestrator.locking import SessionLockRegistry
+from services.orchestrator.relationships import historical_relationships
 
 MEMORY_URL = os.getenv("MEMORY_URL", "http://memory:8000").rstrip("/")
 LEFT_URL = os.getenv("LEFT_URL", "http://left-model:8000").rstrip("/")
@@ -81,7 +84,7 @@ if (
 if not 0.0 < SEMANTIC_REPEAT_SIMILARITY_THRESHOLD <= 1.0:
     raise RuntimeError("SEMANTIC_REPEAT_SIMILARITY_THRESHOLD must be between 0 and 1")
 
-SESSION_TURN_LOCKS: dict[str, asyncio.Lock] = {}
+SESSION_TURN_LOCKS = SessionLockRegistry()
 TURN_CAPACITY = asyncio.Semaphore(MAX_CONCURRENT_TURNS)
 MODEL_METRICS: dict[str, dict[str, int | float | None]] = {
     role: {"calls": 0, "failures": 0, "last_ms": None, "average_ms": None}
@@ -164,15 +167,11 @@ class ReflectionResult(BaseModel):
 async def session_operation_lock(session_id: str):
     """Provide one lock for chat, reflection, and close operations on a session."""
 
-    lock = SESSION_TURN_LOCKS.setdefault(session_id, asyncio.Lock())
     try:
-        await asyncio.wait_for(lock.acquire(), timeout=SESSION_QUEUE_TIMEOUT_SECONDS)
+        async with SESSION_TURN_LOCKS.acquire(session_id, SESSION_QUEUE_TIMEOUT_SECONDS):
+            yield
     except TimeoutError as exc:
         raise HTTPException(409, "Another turn for this conversation is still being processed.") from exc
-    try:
-        yield
-    finally:
-        lock.release()
 
 
 @asynccontextmanager
@@ -1367,6 +1366,12 @@ async def chat(session_id: str, req: ChatRequest) -> dict[str, Any]:
             # corpus records and denied classifications never reach a model.
             "general_knowledge": knowledge_context.get("items", []),
         }
+        # This is the sole citation namespace accepted from Executive factual
+        # claims. The values are visible for grounded writing; the keys are
+        # persisted as audit-friendly provenance.
+        common_context["claim_evidence"] = claim_evidence_catalog(
+            character, state, knowledge_context.get("items", [])
+        )
         cognition_req = CognitiveRequest(
             character=character,
             user_input=req.message,
@@ -1556,6 +1561,7 @@ async def chat(session_id: str, req: ChatRequest) -> dict[str, Any]:
         if not speech:
             raise HTTPException(502, "Executive produced no speech")
         executive = {**executive, "speech": speech}
+        claim_audit = verify_factual_claims(executive, common_context["claim_evidence"])
 
         repeat_revision_ms = 0
         repeat_revision_used = False
@@ -1579,6 +1585,7 @@ async def chat(session_id: str, req: ChatRequest) -> dict[str, Any]:
             if not speech:
                 raise HTTPException(502, "Executive produced no speech on repeat deliberation revision")
             executive = {**executive, "speech": speech}
+            claim_audit = verify_factual_claims(executive, common_context["claim_evidence"])
             if response_substantially_repeats_recent_answers(speech, prior_repeat_speeches):
                 # The emergency response follows the Executive's response mode,
                 # so it cannot collapse the entire conversation into one stock
@@ -1586,7 +1593,11 @@ async def chat(session_id: str, req: ChatRequest) -> dict[str, Any]:
                 speech = repeat_intent_fallback(
                     repeat_assessment or {}, repeat_dynamics.consecutive_repeats
                 )
-                executive = {**executive, "speech": speech}
+                # The deterministic fallback deliberately makes no factual
+                # assertion, so inherited claims from the rejected model text
+                # must not be attached to it.
+                executive = {**executive, "speech": speech, "factual_claims": []}
+                claim_audit = []
                 intent_fallback_used = True
         lobe_execution["repeat_deliberation"] = {
             "enabled": repeat_deliberation["enabled"],
@@ -1604,8 +1615,27 @@ async def chat(session_id: str, req: ChatRequest) -> dict[str, Any]:
             escalation_decision=executive_escalation,
         )
         classification = classification.model_copy(update={"repeat_dynamics": repeat_dynamics})
+        relationships = historical_relationships(message=req.message, topic=topic, review=repeat_review)
 
         turn_proposals: list[dict[str, Any]] = []
+        # Persist the historical relationship separately from repeat posture.
+        # A repeat is therefore one auditable edge type, not the only kind of
+        # relationship the Executive can reason over in later turns.
+        for relationship in relationships:
+            target_id = relationship["target_event_id"]
+            turn_proposals.append(MutationProposal(
+                operation=MutationOperation.LINK_EVENTS,
+                target=str(relationship["subject_key"]),
+                value={
+                    "from": target_id,
+                    "to": user_event.id,
+                    "relationship": relationship["relationship"],
+                },
+                evidence=[target_id, user_event.id or ""],
+                confidence=float(relationship["confidence"]),
+                epistemic_type=EpistemicType.OBSERVATION,
+                reason="Record an Executive-reviewed historical relationship.",
+            ).model_dump(mode="json"))
         if topic_state_changed:
             dynamics_proposal = MutationProposal(
                 operation=MutationOperation.SET_MUTABLE_STATE,
@@ -1634,6 +1664,8 @@ async def chat(session_id: str, req: ChatRequest) -> dict[str, Any]:
                 "left": left_result,
                 "right": right_result,
                 "executive": executive,
+                "claim_verification": claim_audit,
+                "historical_relationships": relationships,
                 "responds_to": user_event.id,
                 "interaction": classification.model_dump(mode="json"),
                 "repeat_review": repeat_review,
@@ -1703,6 +1735,8 @@ async def chat(session_id: str, req: ChatRequest) -> dict[str, Any]:
                 "left": left_result,
                 "right": right_result,
                 "executive": executive,
+                "claim_verification": claim_audit,
+                "historical_relationships": relationships,
                 "lobe_execution": lobe_execution,
                 "repeat_review": repeat_review,
                 "cognitive_priorities": cognitive_priorities,
