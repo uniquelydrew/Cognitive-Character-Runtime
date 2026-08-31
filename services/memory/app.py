@@ -5,7 +5,7 @@ import os
 import re
 import sqlite3
 import uuid
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
@@ -29,6 +29,7 @@ from services.common import (
     ValidatedMutation,
 )
 from services.memory.migrations import apply_migrations
+from services.memory.storage import connection, now_iso
 
 DB_PATH = Path(os.getenv("MEMORY_DATABASE", "/data/cognition.db"))
 CHARACTER_DIR = Path(os.getenv("CHARACTER_DIR", "/characters"))
@@ -266,29 +267,9 @@ class SnapshotRuntime(SnapshotModel):
         return self
 
 
-def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-@contextmanager
 def db(*, before_commit: Any | None = None, on_abort: Any | None = None):
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA journal_mode = WAL")
-    try:
-        yield conn
-        if before_commit is not None:
-            before_commit()
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        if on_abort is not None:
-            on_abort()
-        raise
-    finally:
-        conn.close()
+    """Compatibility façade while routes migrate to the storage module."""
+    return connection(DB_PATH, before_commit=before_commit, on_abort=on_abort)
 
 
 def init_db() -> None:
