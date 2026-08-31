@@ -9,7 +9,7 @@ from fastapi import HTTPException
 os.environ.setdefault("COGNITIVE_ROLE", "left")
 
 from services.cognitive_worker import app as worker  # noqa: E402
-from services.common import CognitiveRequest, ExecutiveRepeatAssessment, LeftAnalysis, RightAnalysis  # noqa: E402
+from services.common import CognitiveRequest, ExecutiveRepeatAssessment, ExecutiveTurn, LeftAnalysis, RightAnalysis  # noqa: E402
 
 
 def test_worker_retries_an_incomplete_json_completion(monkeypatch: pytest.MonkeyPatch):
@@ -34,6 +34,28 @@ def test_worker_retries_an_incomplete_json_completion(monkeypatch: pytest.Monkey
     result = asyncio.run(worker._request_model(request, LeftAnalysis))
 
     assert result.topic == "topic.general"
+    assert retries == [False, True]
+
+
+def test_worker_retries_an_executive_turn_that_omits_claim_audit(monkeypatch: pytest.MonkeyPatch):
+    responses = iter([
+        ('{"goal":"answer","strategy":"answer","speech":"Northbridge.",'
+         '"topic":"self.birthplace","mutations":[],"memory_writes":[]}'),
+        ('{"goal":"answer","strategy":"answer","speech":"Northbridge.",'
+         '"topic":"self.birthplace","factual_claims":[{"text":"Northbridge.",'
+         '"evidence_refs":["identity.birthplace"]}],"mutations":[],"memory_writes":[]}'),
+    ])
+    retries: list[bool] = []
+
+    async def fake_completion(*_args, corrective_retry: bool, **_kwargs) -> str:
+        retries.append(corrective_retry)
+        return next(responses)
+
+    monkeypatch.setattr(worker, "_request_completion", fake_completion)
+
+    result = asyncio.run(worker._request_model(CognitiveRequest.model_construct(), ExecutiveTurn))
+
+    assert result.factual_claims[0].evidence_refs == ["identity.birthplace"]
     assert retries == [False, True]
 
 

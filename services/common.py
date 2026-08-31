@@ -289,7 +289,10 @@ class ExecutiveTurn(ModelOutput):
     # Repeat pressure is evidence, not an automatic emotional reaction. The
     # executive decides whether this turn should alter durable defensiveness.
     repeat_escalation: Literal["hold", "increase", "deescalate"] = "hold"
-    factual_claims: list[ExecutiveClaim] = Field(default_factory=list, max_length=12)
+    # The list itself is required so a compact model cannot silently omit the
+    # claim-audit channel. An explicit empty list remains valid for genuinely
+    # non-factual speech.
+    factual_claims: list[ExecutiveClaim] = Field(max_length=12)
     historical_relationships: list[ExecutiveHistoricalRelationship] = Field(default_factory=list, max_length=8)
     mutations: list[MutationProposal] = Field(default_factory=list, max_length=20)
     memory_writes: list[MemoryWrite] = Field(default_factory=list, max_length=10)

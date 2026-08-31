@@ -59,9 +59,25 @@ def test_executive_turn_contract_requires_nonempty_speech():
             "strategy": "answer from context",
             "speech": "",
             "topic": "topic.general",
+            "factual_claims": [],
             "mutations": [],
             "memory_writes": [],
         })
+
+
+def test_executive_turn_contract_requires_an_explicit_claim_list():
+    payload = {
+        "goal": "maintain continuity",
+        "strategy": "answer from context",
+        "speech": "How can I help?",
+        "topic": "topic.general",
+        "mutations": [],
+        "memory_writes": [],
+    }
+    with pytest.raises(ValidationError, match="factual_claims"):
+        ExecutiveTurn.model_validate(payload)
+
+    assert ExecutiveTurn.model_validate({**payload, "factual_claims": []}).factual_claims == []
 
 
 def test_only_executive_can_reflect():

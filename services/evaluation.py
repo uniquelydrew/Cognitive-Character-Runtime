@@ -61,20 +61,33 @@ def compare_runs(multi: list[dict[str, Any]], control: list[dict[str, Any]]) -> 
     }
 
 
-def run_benchmark(base_url: str, token: str, scenarios: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def run_benchmark(
+    base_url: str, token: str, scenarios: list[dict[str, Any]], *, timeout_seconds: float = 300,
+) -> list[dict[str, Any]]:
     """Execute a manifest against one deployed topology and retain raw output."""
     headers = {"X-API-Key": token}
     results: list[dict[str, Any]] = []
-    with httpx.Client(base_url=base_url.rstrip("/"), headers=headers, timeout=60) as client:
+    # The client must outlive the orchestrator's default 240-second turn limit;
+    # otherwise the evaluator would misclassify a still-valid response as a
+    # benchmark failure.
+    with httpx.Client(base_url=base_url.rstrip("/"), headers=headers, timeout=timeout_seconds) as client:
         for scenario in scenarios:
-            session = client.post("/sessions", json={"character_id": scenario["character_id"]})
+            try:
+                session = client.post("/sessions", json={"character_id": scenario["character_id"]})
+            except httpx.HTTPError as exc:
+                results.append(_transport_failure(scenario, exc))
+                continue
             if session.is_error:
                 results.append({
                     "id": scenario["id"], "expected": scenario["expected"], "successful": False,
                     "status_code": session.status_code, "error": _response_error(session),
                 })
                 continue
-            reply = client.post(f"/sessions/{session.json()['id']}/chat", json={"message": scenario["message"]})
+            try:
+                reply = client.post(f"/sessions/{session.json()['id']}/chat", json={"message": scenario["message"]})
+            except httpx.HTTPError as exc:
+                results.append(_transport_failure(scenario, exc))
+                continue
             if reply.is_error:
                 results.append({
                     "id": scenario["id"], "expected": scenario["expected"], "successful": False,
@@ -93,6 +106,13 @@ def _response_error(response: httpx.Response) -> Any:
     except ValueError:
         return response.text[:1_000]
     return body.get("detail", body) if isinstance(body, dict) else body
+
+
+def _transport_failure(scenario: dict[str, Any], error: httpx.HTTPError) -> dict[str, Any]:
+    return {
+        "id": scenario["id"], "expected": scenario["expected"], "successful": False,
+        "status_code": None, "error": f"transport_error: {type(error).__name__}",
+    }
 
 
 def main() -> None:
