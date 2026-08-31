@@ -6,7 +6,7 @@ import re
 import sqlite3
 import uuid
 from contextlib import asynccontextmanager, contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
 
@@ -35,6 +35,8 @@ KNOWLEDGE_DIR = Path(os.getenv("KNOWLEDGE_DIR", "/knowledge"))
 PROFILE_ID_RE = re.compile(r"^[a-z][a-z0-9_-]{1,63}$")
 SNAPSHOT_FORMAT = "cognitive-character-runtime/character-snapshot/v1"
 MAX_SESSION_EVENTS_RETURNED = int(os.getenv("MAX_SESSION_EVENTS_RETURNED", "200"))
+MANAGED_KNOWLEDGE_FILENAME = "catalog.yaml"
+KNOWLEDGE_SAMPLE_FILENAME = "catalog.example.yaml"
 
 if MAX_SESSION_EVENTS_RETURNED < 20:
     raise RuntimeError("MAX_SESSION_EVENTS_RETURNED must be at least 20")
@@ -60,6 +62,22 @@ class ProfileDiffRequest(BaseModel):
     """An earlier exported snapshot to compare with the current profile state."""
 
     yaml: str = Field(min_length=1, max_length=5_000_000)
+
+
+class KnowledgeCatalogRequest(BaseModel):
+    """A complete general-knowledge catalog submitted by Knowledge Studio."""
+
+    yaml: str = Field(min_length=1, max_length=5_000_000)
+
+
+class ReflectionRetrySchedule(BaseModel):
+    """A safe, bounded explanation for a reflection queued after close."""
+
+    error: str = Field(min_length=1, max_length=1_000)
+
+
+class ReflectionRetryClaim(BaseModel):
+    lease_seconds: int = Field(default=300, ge=30, le=3_600)
 
 
 class SnapshotModel(BaseModel):
@@ -390,6 +408,23 @@ def init_db() -> None:
                 created_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS reflection_jobs (
+                session_id TEXT PRIMARY KEY,
+                character_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                next_attempt_at TEXT NOT NULL,
+                lease_expires_at TEXT,
+                completed_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(session_id) REFERENCES sessions(id),
+                FOREIGN KEY(character_id) REFERENCES characters(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_reflection_jobs_due
+                ON reflection_jobs(status, next_attempt_at, lease_expires_at);
+
             CREATE TABLE IF NOT EXISTS knowledge_classifications (
                 id TEXT PRIMARY KEY,
                 document_json TEXT NOT NULL
@@ -461,18 +496,25 @@ def _validate_knowledge_taxonomy(
         visit(node_id)
 
 
-def load_knowledge_files() -> None:
-    """Load the general corpus as source-controlled, not conversation-derived data."""
+def _knowledge_source_paths() -> list[Path]:
+    """Select the editable managed catalog, or fall back to bundled source files."""
 
     if not KNOWLEDGE_DIR.exists():
-        with db() as conn:
-            conn.execute("DELETE FROM knowledge_record_labels")
-            conn.execute("DELETE FROM knowledge_records")
-            conn.execute("DELETE FROM knowledge_classifications")
-        return
+        return []
+    managed = KNOWLEDGE_DIR / MANAGED_KNOWLEDGE_FILENAME
+    if managed.exists():
+        return [managed]
+    return [
+        path
+        for path in sorted(KNOWLEDGE_DIR.glob("*.yaml"))
+        if not path.name.endswith(".example.yaml")
+    ]
+
+
+def _catalog_from_source_paths(paths: list[Path]) -> KnowledgeCatalog:
     classifications: list[KnowledgeClassification] = []
     records: list[GeneralKnowledgeRecord] = []
-    for path in sorted(KNOWLEDGE_DIR.glob("*.yaml")):
+    for path in paths:
         try:
             raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
             catalog = KnowledgeCatalog.model_validate(raw)
@@ -481,24 +523,37 @@ def load_knowledge_files() -> None:
         classifications.extend(catalog.classifications)
         records.extend(catalog.records)
     _validate_knowledge_taxonomy(classifications, records)
+    return KnowledgeCatalog(classifications=classifications, records=records)
+
+
+def _replace_knowledge_catalog(catalog: KnowledgeCatalog, conn: sqlite3.Connection) -> None:
+    """Replace the indexed corpus inside an existing transaction."""
+
+    conn.execute("DELETE FROM knowledge_record_labels")
+    conn.execute("DELETE FROM knowledge_records")
+    conn.execute("DELETE FROM knowledge_classifications")
+    for node in catalog.classifications:
+        conn.execute(
+            "INSERT INTO knowledge_classifications(id, document_json) VALUES (?, ?)",
+            (node.id, node.model_dump_json()),
+        )
+    for record in catalog.records:
+        conn.execute(
+            "INSERT INTO knowledge_records(id, document_json) VALUES (?, ?)",
+            (record.id, record.model_dump_json()),
+        )
+        conn.executemany(
+            "INSERT INTO knowledge_record_labels(record_id, label_id) VALUES (?, ?)",
+            [(record.id, label) for label in record.labels],
+        )
+
+
+def load_knowledge_files() -> None:
+    """Load general knowledge from its canonical managed or starter source files."""
+
+    catalog = _catalog_from_source_paths(_knowledge_source_paths())
     with db() as conn:
-        conn.execute("DELETE FROM knowledge_record_labels")
-        conn.execute("DELETE FROM knowledge_records")
-        conn.execute("DELETE FROM knowledge_classifications")
-        for node in classifications:
-            conn.execute(
-                "INSERT INTO knowledge_classifications(id, document_json) VALUES (?, ?)",
-                (node.id, node.model_dump_json()),
-            )
-        for record in records:
-            conn.execute(
-                "INSERT INTO knowledge_records(id, document_json) VALUES (?, ?)",
-                (record.id, record.model_dump_json()),
-            )
-            conn.executemany(
-                "INSERT INTO knowledge_record_labels(record_id, label_id) VALUES (?, ?)",
-                [(record.id, label) for label in record.labels],
-            )
+        _replace_knowledge_catalog(catalog, conn)
 
 
 def profile_path(character_id: str) -> Path:
@@ -873,6 +928,120 @@ def character_snapshot(character_id: str) -> dict[str, Any]:
     }
 
 
+def _knowledge_catalog_text(catalog: KnowledgeCatalog) -> str:
+    return yaml.safe_dump(
+        catalog.model_dump(mode="json", exclude_none=True),
+        allow_unicode=True,
+        sort_keys=False,
+    )
+
+
+def _knowledge_catalog_summary(catalog: KnowledgeCatalog) -> dict[str, int]:
+    return {
+        "classification_count": len(catalog.classifications),
+        "record_count": len(catalog.records),
+        "assertion_count": sum(len(record.assertions) for record in catalog.records),
+    }
+
+
+def current_knowledge_catalog() -> KnowledgeCatalog:
+    """Return the complete static corpus, never character-specific retrieval output."""
+
+    with db() as conn:
+        classifications = [
+            KnowledgeClassification.model_validate_json(row["document_json"])
+            for row in conn.execute(
+                "SELECT document_json FROM knowledge_classifications ORDER BY id"
+            )
+        ]
+        records = [
+            GeneralKnowledgeRecord.model_validate_json(row["document_json"])
+            for row in conn.execute("SELECT document_json FROM knowledge_records ORDER BY id")
+        ]
+    catalog = KnowledgeCatalog(classifications=classifications, records=records)
+    _validate_knowledge_taxonomy(catalog.classifications, catalog.records)
+    return catalog
+
+
+def _catalog_from_uploaded_yaml(source_text: str) -> KnowledgeCatalog:
+    raw = _safe_load_uploaded_yaml(source_text)
+    try:
+        catalog = KnowledgeCatalog.model_validate(raw)
+        _validate_knowledge_taxonomy(catalog.classifications, catalog.records)
+    except (ValidationError, ValueError) as exc:
+        raise HTTPException(422, f"Knowledge catalog is invalid: {exc}") from exc
+    return catalog
+
+
+def _write_managed_knowledge_catalog(catalog: KnowledgeCatalog) -> Path:
+    """Atomically activate one editable catalog and replace its runtime index."""
+
+    KNOWLEDGE_DIR.mkdir(parents=True, exist_ok=True)
+    path = KNOWLEDGE_DIR / MANAGED_KNOWLEDGE_FILENAME
+    original = path.read_bytes() if path.exists() else None
+    temporary = path.with_suffix(f".yaml.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(_knowledge_catalog_text(catalog), encoding="utf-8")
+    except OSError as exc:
+        raise HTTPException(503, "The managed knowledge source could not be saved.") from exc
+    source_replaced = False
+
+    def commit_source() -> None:
+        nonlocal source_replaced
+        try:
+            temporary.replace(path)
+            source_replaced = True
+        except OSError as exc:
+            raise HTTPException(503, "The managed knowledge source could not be saved.") from exc
+
+    def abort_source() -> None:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        if source_replaced:
+            _restore_source_bytes(path, original)
+
+    try:
+        with db(before_commit=commit_source, on_abort=abort_source) as conn:
+            _replace_knowledge_catalog(catalog, conn)
+    except Exception:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    return path
+
+
+def _knowledge_sample_text() -> str:
+    sample_path = KNOWLEDGE_DIR / KNOWLEDGE_SAMPLE_FILENAME
+    if sample_path.exists():
+        try:
+            return sample_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise HTTPException(503, "The knowledge sample could not be read.") from exc
+    # Keep the endpoint useful for API-only deployments even when the optional
+    # example file was not mounted alongside the active source.
+    return _knowledge_catalog_text(KnowledgeCatalog(
+        classifications=[
+            KnowledgeClassification(id="access.public", aliases=["public", "common knowledge"]),
+            KnowledgeClassification(id="place.example_town", aliases=["example town"]),
+            KnowledgeClassification(id="community.example_staff", aliases=["example staff"]),
+            KnowledgeClassification(id="domain.example_subject", aliases=["example subject"]),
+        ],
+        records=[
+            GeneralKnowledgeRecord(
+                id="example_town.public_fact",
+                labels=["place.example_town", "domain.example_subject"],
+                access={"require_all": ["access.public", "place.example_town"]},
+                assertions=["Replace this assertion with a setting fact supported by an in-world source."],
+                source="Example source or authority",
+            )
+        ],
+    ))
+
+
 def _knowledge_nodes() -> dict[str, KnowledgeClassification]:
     with db() as conn:
         rows = conn.execute("SELECT document_json FROM knowledge_classifications ORDER BY id").fetchall()
@@ -957,6 +1126,61 @@ def knowledge_classifications() -> list[dict[str, Any]]:
     return [node.model_dump(mode="json") for node in _knowledge_nodes().values()]
 
 
+@app.get("/knowledge/catalog")
+def knowledge_catalog() -> dict[str, Any]:
+    """Return the complete editable catalog and its authoritative source mode."""
+
+    catalog = current_knowledge_catalog()
+    source_paths = _knowledge_source_paths()
+    managed = len(source_paths) == 1 and source_paths[0].name == MANAGED_KNOWLEDGE_FILENAME
+    return {
+        "catalog": catalog.model_dump(mode="json"),
+        "summary": _knowledge_catalog_summary(catalog),
+        "source_files": [path.name for path in source_paths],
+        "managed": managed,
+    }
+
+
+@app.get("/knowledge/export")
+def export_knowledge_catalog() -> Response:
+    catalog = current_knowledge_catalog()
+    return Response(
+        content=_knowledge_catalog_text(catalog),
+        media_type="application/yaml",
+        headers={"Content-Disposition": 'attachment; filename="knowledge-catalog.yaml"'},
+    )
+
+
+@app.get("/knowledge/schema-sample")
+def export_knowledge_schema_sample() -> Response:
+    return Response(
+        content=_knowledge_sample_text(),
+        media_type="application/yaml",
+        headers={"Content-Disposition": 'attachment; filename="catalog.example.yaml"'},
+    )
+
+
+@app.post("/knowledge/validate")
+def validate_knowledge_catalog(request: KnowledgeCatalogRequest) -> dict[str, Any]:
+    catalog = _catalog_from_uploaded_yaml(request.yaml)
+    return {"valid": True, "summary": _knowledge_catalog_summary(catalog)}
+
+
+@app.put("/knowledge/catalog")
+@app.post("/knowledge/import")
+def import_knowledge_catalog(request: KnowledgeCatalogRequest) -> dict[str, Any]:
+    """Validate and atomically activate a complete managed knowledge catalog."""
+
+    catalog = _catalog_from_uploaded_yaml(request.yaml)
+    path = _write_managed_knowledge_catalog(catalog)
+    return {
+        "catalog": catalog.model_dump(mode="json"),
+        "summary": _knowledge_catalog_summary(catalog),
+        "source_file": path.name,
+        "managed": True,
+    }
+
+
 @app.get("/knowledge/for-character/{character_id}")
 def character_knowledge(
     character_id: str,
@@ -998,7 +1222,7 @@ def character_knowledge(
                 "labels": record.labels,
                 "matched_labels": matched_labels,
                 "access_reason": access_reason,
-                "epistemic_type": record.epistemic_type.value,
+                "epistemic_type": record.epistemic_type,
                 "confidence": record.confidence,
                 "source": record.source,
                 "_score": score,
@@ -1401,6 +1625,158 @@ def close_session(session_id: str) -> dict[str, str]:
     return {"id": session_id, "status": "closed", "closed_at": ts}
 
 
+def _reflection_job_payload(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "session_id": row["session_id"],
+        "character_id": row["character_id"],
+        "status": row["status"],
+        "attempts": int(row["attempts"]),
+        "last_error": row["last_error"],
+        "next_attempt_at": row["next_attempt_at"],
+        "lease_expires_at": row["lease_expires_at"],
+        "completed_at": row["completed_at"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+@app.post("/reflection-jobs/{session_id}/schedule")
+def schedule_reflection_retry(session_id: str, request: ReflectionRetrySchedule) -> dict[str, Any]:
+    """Persist a close-time reflection failure for asynchronous retry."""
+
+    ts = now_iso()
+    with db() as conn:
+        session = conn.execute(
+            "SELECT character_id FROM sessions WHERE id=?", (session_id,)
+        ).fetchone()
+        if not session:
+            raise HTTPException(404, "Session not found")
+        existing = conn.execute(
+            "SELECT * FROM reflection_jobs WHERE session_id=?", (session_id,)
+        ).fetchone()
+        if existing and existing["status"] == "completed":
+            return {**_reflection_job_payload(existing), "already_completed": True}
+        if existing:
+            conn.execute(
+                """
+                UPDATE reflection_jobs
+                SET status='pending', last_error=?, next_attempt_at=?, lease_expires_at=NULL, updated_at=?
+                WHERE session_id=?
+                """,
+                (request.error, ts, ts, session_id),
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO reflection_jobs(
+                    session_id, character_id, status, attempts, last_error, next_attempt_at,
+                    lease_expires_at, completed_at, created_at, updated_at
+                ) VALUES (?, ?, 'pending', 0, ?, ?, NULL, NULL, ?, ?)
+                """,
+                (session_id, session["character_id"], request.error, ts, ts, ts),
+            )
+        row = conn.execute("SELECT * FROM reflection_jobs WHERE session_id=?", (session_id,)).fetchone()
+    return _reflection_job_payload(row)
+
+
+@app.post("/reflection-jobs/claim")
+def claim_reflection_retry(request: ReflectionRetryClaim) -> dict[str, Any]:
+    """Atomically lease one due reflection job to a single orchestrator."""
+
+    ts = now_iso()
+    lease_until = (datetime.now(timezone.utc) + timedelta(seconds=request.lease_seconds)).isoformat()
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT * FROM reflection_jobs
+            WHERE (status='pending' AND next_attempt_at <= ?)
+               OR (status='running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?)
+            ORDER BY next_attempt_at, created_at
+            LIMIT 1
+            """,
+            (ts, ts),
+        ).fetchone()
+        if not row:
+            return {"job": None}
+        conn.execute(
+            """
+            UPDATE reflection_jobs
+            SET status='running', attempts=attempts + 1, lease_expires_at=?, updated_at=?
+            WHERE session_id=?
+            """,
+            (lease_until, ts, row["session_id"]),
+        )
+        claimed = conn.execute(
+            "SELECT * FROM reflection_jobs WHERE session_id=?", (row["session_id"],)
+        ).fetchone()
+    return {"job": _reflection_job_payload(claimed)}
+
+
+@app.post("/reflection-jobs/{session_id}/complete")
+def complete_reflection_retry(session_id: str) -> dict[str, Any]:
+    """Mark a queued reflection complete without deleting its operational audit."""
+
+    ts = now_iso()
+    with db() as conn:
+        row = conn.execute("SELECT * FROM reflection_jobs WHERE session_id=?", (session_id,)).fetchone()
+        if not row:
+            return {"found": False, "session_id": session_id}
+        conn.execute(
+            """
+            UPDATE reflection_jobs
+            SET status='completed', last_error=NULL, next_attempt_at=?, lease_expires_at=NULL,
+                completed_at=?, updated_at=?
+            WHERE session_id=?
+            """,
+            (ts, ts, ts, session_id),
+        )
+        completed = conn.execute(
+            "SELECT * FROM reflection_jobs WHERE session_id=?", (session_id,)
+        ).fetchone()
+    return {"found": True, **_reflection_job_payload(completed)}
+
+
+@app.post("/reflection-jobs/{session_id}/reschedule")
+def reschedule_reflection_retry(session_id: str, request: ReflectionRetrySchedule) -> dict[str, Any]:
+    """Release a failed lease with bounded exponential backoff."""
+
+    ts = now_iso()
+    with db() as conn:
+        row = conn.execute("SELECT * FROM reflection_jobs WHERE session_id=?", (session_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Reflection retry job not found")
+        attempts = max(int(row["attempts"]), 1)
+        delay_seconds = min(30 * (2 ** min(attempts - 1, 7)), 3_600)
+        next_attempt = (datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)).isoformat()
+        conn.execute(
+            """
+            UPDATE reflection_jobs
+            SET status='pending', last_error=?, next_attempt_at=?, lease_expires_at=NULL, updated_at=?
+            WHERE session_id=?
+            """,
+            (request.error, next_attempt, ts, session_id),
+        )
+        scheduled = conn.execute(
+            "SELECT * FROM reflection_jobs WHERE session_id=?", (session_id,)
+        ).fetchone()
+    return {"backoff_seconds": delay_seconds, **_reflection_job_payload(scheduled)}
+
+
+@app.get("/reflection-jobs")
+def reflection_jobs(limit: int = Query(50, ge=1, le=200)) -> dict[str, Any]:
+    """Expose retry state for the authenticated runtime-status dashboard."""
+
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM reflection_jobs ORDER BY updated_at DESC LIMIT ?", (limit,)
+        ).fetchall()
+    jobs = [_reflection_job_payload(row) for row in rows]
+    return {
+        "jobs": jobs,
+        "pending_count": sum(job["status"] in {"pending", "running"} for job in jobs),
+    }
+
+
 def _add_event(event: EventRecord, conn: sqlite3.Connection) -> EventRecord:
     """Validate and insert an event using an existing transaction."""
 
@@ -1417,7 +1793,7 @@ def _add_event(event: EventRecord, conn: sqlite3.Connection) -> EventRecord:
             raise HTTPException(404, "Session not found")
         if session["character_id"] != event.character_id:
             raise HTTPException(409, "Event character does not match session character")
-        if session["status"] != "open":
+        if session["status"] != "open" and event.event_type != "reflection":
             raise HTTPException(409, "Interaction is already closed")
     try:
         metadata_json = json.dumps(event.metadata, allow_nan=False)

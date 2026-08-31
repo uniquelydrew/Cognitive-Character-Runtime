@@ -102,6 +102,17 @@ KnowledgeLabel = Annotated[
     Field(min_length=2, max_length=96, pattern=r"^[a-z][a-z0-9_.-]*$"),
 ]
 
+# General-knowledge sources are authored for a particular setting.  Unlike a
+# character memory or a proposed runtime mutation, their epistemic categories
+# are not a closed system: a setting may distinguish a canon policy from a
+# contested principle, an historical fact from a current observation, and so
+# on.  Keep that domain vocabulary intact while still requiring a bounded,
+# machine-readable label.
+KnowledgeEpistemicType = Annotated[
+    str,
+    Field(min_length=2, max_length=96, pattern=r"^[a-z][a-z0-9_.-]*$"),
+]
+
 
 class KnowledgeClassification(BaseModel):
     """One node in the source-of-truth general-knowledge classification DAG."""
@@ -124,7 +135,7 @@ class KnowledgeAccessRule(BaseModel):
 
 
 class GeneralKnowledgeRecord(BaseModel):
-    """A reusable fact set, deliberately distinct from events and memories."""
+    """A reusable setting record, deliberately distinct from events and memories."""
 
     model_config = {"extra": "forbid"}
 
@@ -132,7 +143,9 @@ class GeneralKnowledgeRecord(BaseModel):
     labels: list[KnowledgeLabel] = Field(min_length=1, max_length=24)
     access: KnowledgeAccessRule = Field(default_factory=KnowledgeAccessRule)
     assertions: list[str] = Field(min_length=1, max_length=24)
-    epistemic_type: EpistemicType = EpistemicType.FACT
+    # This is intentionally not ``EpistemicType``.  That enum governs runtime
+    # memories and mutations; catalog authors need setting-specific categories.
+    epistemic_type: KnowledgeEpistemicType = "fact"
     confidence: float = Field(default=1.0, ge=0.0, le=1.0)
     source: str = Field(default="", max_length=500)
 
