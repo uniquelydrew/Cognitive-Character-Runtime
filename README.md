@@ -118,6 +118,13 @@ deployment and an Executive-only control, save results with stable `id`,
 python -m services.evaluation --multi multi.json --control control.json
 ```
 
+`benchmarks/core.json` is the committed starting manifest. Produce each input
+against separately started normal and `EXECUTIVE_ONLY_CONTROL=true` stacks:
+
+```text
+python -m services.evaluation --benchmark benchmarks/core.json --base-url http://127.0.0.1:8080 --token "$API_AUTH_TOKEN" --output multi.json
+```
+
 It reports paired correctness deltas, wins/losses/ties, and claim-verification
 counts. It intentionally measures observable responses rather than hidden model
 reasoning; a conclusion requires a representative scenario set and repeated

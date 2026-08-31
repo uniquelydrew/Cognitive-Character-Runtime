@@ -1,0 +1,6 @@
+[
+  {"id": "elena.birthplace", "character_id": "elena_voss", "message": "Where were you born?", "expected": ["Northbridge"]},
+  {"id": "elena.occupation", "character_id": "elena_voss", "message": "What is your occupation?", "expected": ["Harbormaster"]},
+  {"id": "tomas.birthplace", "character_id": "tomas_reed", "message": "What is your hometown?", "expected": ["Greyhaven"]},
+  {"id": "tomas.occupation", "character_id": "tomas_reed", "message": "What is your job?", "expected": ["Cartographer"]}
+]

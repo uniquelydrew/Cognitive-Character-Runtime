@@ -15,6 +15,8 @@ from pathlib import Path
 from statistics import mean
 from typing import Any
 
+import httpx
+
 
 def _terms(value: str) -> set[str]:
     return set(re.findall(r"[a-z0-9]+", value.lower()))
@@ -57,11 +59,37 @@ def compare_runs(multi: list[dict[str, Any]], control: list[dict[str, Any]]) -> 
     }
 
 
+def run_benchmark(base_url: str, token: str, scenarios: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Execute a manifest against one deployed topology and retain raw output."""
+    headers = {"X-API-Key": token}
+    results: list[dict[str, Any]] = []
+    with httpx.Client(base_url=base_url.rstrip("/"), headers=headers, timeout=60) as client:
+        for scenario in scenarios:
+            session = client.post("/sessions", json={"character_id": scenario["character_id"]})
+            session.raise_for_status()
+            reply = client.post(f"/sessions/{session.json()['id']}/chat", json={"message": scenario["message"]})
+            reply.raise_for_status()
+            results.append({"id": scenario["id"], "expected": scenario["expected"], **reply.json()})
+    return results
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Compare multi-perspective and control benchmark responses.")
-    parser.add_argument("--multi", type=Path, required=True)
-    parser.add_argument("--control", type=Path, required=True)
+    parser.add_argument("--multi", type=Path)
+    parser.add_argument("--control", type=Path)
+    parser.add_argument("--benchmark", type=Path, help="Scenario manifest to execute against one deployment.")
+    parser.add_argument("--base-url", help="Orchestrator URL for --benchmark mode.")
+    parser.add_argument("--token", help="API token for --benchmark mode.")
+    parser.add_argument("--output", type=Path, help="Write benchmark responses to this JSON file.")
     args = parser.parse_args()
+    if args.benchmark:
+        if not all((args.base_url, args.token, args.output)):
+            parser.error("--benchmark requires --base-url, --token, and --output")
+        results = run_benchmark(args.base_url, args.token, json.loads(args.benchmark.read_text()))
+        args.output.write_text(json.dumps(results, indent=2), encoding="utf-8")
+        return
+    if not args.multi or not args.control:
+        parser.error("provide --multi and --control, or use --benchmark")
     print(json.dumps(compare_runs(json.loads(args.multi.read_text()), json.loads(args.control.read_text())), indent=2))
 
 
