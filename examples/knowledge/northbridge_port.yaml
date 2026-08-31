@@ -1,0 +1,17 @@
+classifications:
+  - {id: access.public, aliases: [public, common knowledge], description: Information ordinarily available in the setting.}
+  - {id: place.northbridge, aliases: [northbridge], description: Northbridge locality.}
+  - {id: community.port_staff, aliases: [port staff, dock staff], description: Personnel who work port operations.}
+  - {id: role.harbormaster, parents: [community.port_staff], aliases: [harbormaster], description: Port operational authority.}
+  - {id: domain.port_administration, aliases: [port administration, port operations], description: Port administrative processes.}
+records:
+  - id: northbridge.port_record_delays
+    labels: [place.northbridge, domain.port_administration]
+    access: {require_all: [access.public, place.northbridge]}
+    assertions: [Port record processing can be delayed during high traffic or system reconciliation.]
+    source: Northbridge public port notices
+  - id: northbridge.harbormaster_escalation
+    labels: [role.harbormaster, domain.port_administration]
+    access: {require_all: [role.harbormaster]}
+    assertions: [A harbormaster coordinates operational response when a record discrepancy may affect departures or safety.]
+    source: Port Authority role charter

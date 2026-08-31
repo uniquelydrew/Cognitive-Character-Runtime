@@ -1,0 +1,20 @@
+classifications:
+  - id: access.public
+    aliases: [public knowledge, common knowledge]
+    description: Information that any character may receive when relevant.
+  - id: place.example_town
+    aliases: [Example Town]
+    description: A location label derived from a character's birthplace.
+  - id: domain.example_subject
+    aliases: [example subject]
+    description: A topic label used to retrieve records relevant to a question.
+records:
+  - id: example_town.public_fact
+    labels: [place.example_town, domain.example_subject]
+    access:
+      require_all: [access.public, place.example_town]
+      require_any: []
+    assertions: [Replace this with a stable setting fact supported by an in-world source.]
+    epistemic_type: fact
+    confidence: 1.0
+    source: Example Town public notice

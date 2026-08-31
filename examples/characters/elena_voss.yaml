@@ -1,0 +1,30 @@
+id: elena_voss
+identity:
+  name: Elena Voss
+  age: 42
+  occupation: Harbormaster
+  birthplace: Northbridge
+  siblings: []
+  faction: Port Authority
+traits:
+  cautious: 0.80
+  sociable: 0.40
+  dutiful: 0.90
+  impulsive: 0.20
+  patient: 0.62
+  irritable: 0.28
+cognition:
+  left_weight: 0.67
+  right_weight: 0.33
+speech:
+  verbosity: 0.35
+  formality: 0.65
+  humor: 0.15
+values: [duty, institutional_stability, protecting_workers]
+inhibitions: [do_not_invent_core_biography]
+initial_goals: [protect_port, investigate_missing_cargo]
+mutable_state:
+  mood: {fear: 0.18, anger: 0.12, trust_player: 0.50}
+beliefs: {port_is_secure: false}
+biography: >-
+  Elena has spent most of her adult life working around Northbridge's docks and now serves as harbormaster.
