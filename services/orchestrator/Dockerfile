@@ -6,4 +6,4 @@ RUN addgroup --system runtime && adduser --system --ingroup runtime runtime
 COPY --chown=runtime:runtime services /app/services
 ENV PYTHONPATH=/app PYTHONDONTWRITEBYTECODE=1
 USER runtime
-CMD ["uvicorn", "services.orchestrator.app:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "services.orchestrator.runtime:app", "--host", "0.0.0.0", "--port", "8000"]
