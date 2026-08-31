@@ -155,7 +155,7 @@ def test_catalog_import_is_atomic_and_activates_one_managed_source(tmp_path: Pat
 
 
 def test_catalog_schema_example_is_valid_and_can_be_downloaded(tmp_path: Path, monkeypatch):
-    sample_path = Path(__file__).resolve().parents[1] / "knowledge" / "catalog.example.yaml"
+    sample_path = Path(__file__).resolve().parents[1] / "examples" / "knowledge" / "catalog.example.yaml"
     example = KnowledgeCatalog.model_validate(yaml.safe_load(sample_path.read_text(encoding="utf-8")))
     memory._validate_knowledge_taxonomy(example.classifications, example.records)
 
