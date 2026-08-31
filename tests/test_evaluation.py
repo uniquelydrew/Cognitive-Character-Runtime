@@ -8,6 +8,7 @@ def test_paired_evaluation_reports_observable_correctness_delta() -> None:
     )
     assert report["mean_correctness_delta"] == 1.0
     assert report["multi_wins"] == 1
+    assert report["improvement_supported"] is True
 
 
 def test_benchmark_runner_retains_scenario_identity(monkeypatch) -> None:
@@ -23,7 +24,8 @@ def test_benchmark_runner_retains_scenario_identity(monkeypatch) -> None:
             return Response({"id": "sess_test"} if url == "/sessions" else {"message": "Northbridge", "cognition": {}})
     monkeypatch.setattr("services.evaluation.httpx.Client", Client)
     result = run_benchmark("http://example", "token", [{"id": "case", "character_id": "elena_voss", "message": "Where?", "expected": ["Northbridge"]}])
-    assert result[0]["id"] == "case"
+    assert result[0]["id"] == "case@1"
+    assert result[0]["scenario_id"] == "case"
     assert result[0]["successful"] is True
 
 
@@ -42,4 +44,21 @@ def test_benchmark_runner_retains_rejected_turns(monkeypatch) -> None:
 
     result = run_benchmark("http://example", "token", [{"id": "case", "character_id": "elena_voss", "message": "Where?", "expected": ["Northbridge"]}])
 
-    assert result == [{"id": "case", "expected": ["Northbridge"], "successful": False, "status_code": 422, "error": "citation rejected"}]
+    assert result == [{"id": "case@1", "scenario_id": "case", "trial": 1, "expected": ["Northbridge"], "successful": False, "status_code": 422, "error": "citation rejected"}]
+
+
+def test_benchmark_runner_assigns_unique_ids_to_repetitions(monkeypatch) -> None:
+    class Response:
+        is_error = False
+        def __init__(self, value): self.value = value
+        def json(self): return self.value
+    class Client:
+        def __init__(self, **_): pass
+        def __enter__(self): return self
+        def __exit__(self, *_): pass
+        def post(self, url, json): return Response({"id": "session"} if url == "/sessions" else {"message": "Northbridge", "cognition": {}})
+    monkeypatch.setattr("services.evaluation.httpx.Client", Client)
+
+    result = run_benchmark("http://example", "token", [{"id": "case", "character_id": "elena_voss", "message": "Where?", "expected": ["Northbridge"]}], repetitions=2)
+
+    assert [row["id"] for row in result] == ["case@1", "case@2"]
