@@ -330,7 +330,12 @@ This policy boundary is deterministic infrastructure rather than an LLM instruct
 
 ```text
 .
-├── characters/
+├── examples/
+│   ├── characters/              # committed starter primers and test fixtures
+│   └── knowledge/               # committed starter catalog and schema example
+├── runtime-data/
+│   ├── characters/              # local, ignored Profile Studio content
+│   └── knowledge/               # local, ignored Knowledge Studio content
 │   ├── elena_voss.yaml
 │   └── tomas_reed.yaml
 ├── services/
@@ -468,7 +473,7 @@ event and returned in `cognition` for audit.
 
 ## Profile Studio and source of truth
 
-Profile Studio edits the canonical YAML file in `characters/` and immediately
+Profile Studio edits the canonical YAML file in `runtime-data/characters/` and immediately
 updates the runtime's design-time character document. It exposes identity,
 traits, cognition, speech, values, inhibitions, goals, biography, source
 defaults, and an advanced complete-document JSON editor.
@@ -497,7 +502,7 @@ stores rather than leaving a mixed primer/runtime state.
 ## General knowledge and classification hierarchy
 
 General knowledge is not stored as a recent event or a character memory. It is a
-catalog under `knowledge/`, organized by classification nodes and indexed by
+catalog under `runtime-data/knowledge/`, organized by classification nodes and indexed by
 those labels. A node may inherit from one or more parent nodes; the loader and
 Knowledge Studio reject unknown parents and cycles.
 
@@ -529,8 +534,8 @@ or grant this general-knowledge source.
 
 ### Knowledge Studio, catalog import, and schema sample
 
-`knowledge/northbridge_port.yaml` is the starter corpus. The first save or
-import from Knowledge Studio writes `knowledge/catalog.yaml`; that managed file
+`examples/knowledge/northbridge_port.yaml` is the starter corpus. The first save or
+import from Knowledge Studio writes `runtime-data/knowledge/catalog.yaml`; that managed file
 then becomes the single authoritative source and takes precedence over bundled
 starter files. `knowledge/catalog.example.yaml` is a complete valid schema
 example that is intentionally ignored by the loader. It provides the shape for

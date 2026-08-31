@@ -273,6 +273,14 @@ class ExecutiveClaim(ModelOutput):
     evidence_refs: list[str] = Field(min_length=1, max_length=12)
 
 
+class ExecutiveHistoricalRelationship(ModelOutput):
+    """A bounded, reviewable relationship to an earlier recorded turn."""
+
+    prior_event_id: str = Field(min_length=1, max_length=120)
+    relationship: Literal["revisits", "follows_up", "clarifies", "challenges", "contradicts", "supports"]
+    confidence: float = Field(ge=0.0, le=1.0)
+
+
 class ExecutiveTurn(ModelOutput):
     goal: str = Field(min_length=1, max_length=500)
     strategy: str = Field(min_length=1, max_length=500)
@@ -282,6 +290,7 @@ class ExecutiveTurn(ModelOutput):
     # executive decides whether this turn should alter durable defensiveness.
     repeat_escalation: Literal["hold", "increase", "deescalate"] = "hold"
     factual_claims: list[ExecutiveClaim] = Field(default_factory=list, max_length=12)
+    historical_relationships: list[ExecutiveHistoricalRelationship] = Field(default_factory=list, max_length=8)
     mutations: list[MutationProposal] = Field(default_factory=list, max_length=20)
     memory_writes: list[MemoryWrite] = Field(default_factory=list, max_length=10)
 

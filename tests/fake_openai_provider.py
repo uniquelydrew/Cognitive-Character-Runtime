@@ -44,6 +44,7 @@ def _answer(request: dict[str, Any]) -> str | None:
         "born": "birthplace",
         "birthplace": "birthplace",
         "hometown": "birthplace",
+        "from": "birthplace",
         "name": "name",
         "occupation": "occupation",
         "job": "occupation",
@@ -56,6 +57,7 @@ def _answer(request: dict[str, Any]) -> str | None:
 @app.post("/v1/chat/completions")
 def completions(body: dict[str, Any]) -> dict[str, Any]:
     request = json.loads(body["messages"][1]["content"])
+    identity = request["character"]["identity"]
     system_prompt = body["messages"][0]["content"]
     interaction = request.get("context", {}).get("interaction", {})
 
@@ -97,6 +99,7 @@ def completions(body: dict[str, Any]) -> dict[str, Any]:
                 "text": answer,
                 "evidence_refs": ["identity.birthplace"] if "birthplace" in identity and answer == str(identity["birthplace"]) else [],
             }] if answer != "I do not have enough established information." else []),
+            "historical_relationships": [],
             "mutations": [],
             "memory_writes": [{
                 "kind": "self_history",

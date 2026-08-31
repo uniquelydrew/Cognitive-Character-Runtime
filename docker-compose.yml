@@ -81,11 +81,11 @@ services:
       - cognition-data:/data
       # Profile Studio persists validated primers here. Runtime conversation state
       # remains in the separate cognition-data volume.
-      - ./characters:/characters
+      - ./runtime-data/characters:/characters
       # General knowledge remains separate from conversation state. Only the
       # authenticated Knowledge Studio routes can write its validated catalog;
       # cognitive workers and model output never receive a write path.
-      - ./knowledge:/knowledge
+      - ./runtime-data/knowledge:/knowledge
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=64m

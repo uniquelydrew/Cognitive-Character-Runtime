@@ -32,7 +32,7 @@ from services.common import (
 )
 from services.orchestrator.claims import claim_evidence_catalog, verify_factual_claims
 from services.orchestrator.locking import SessionLockRegistry
-from services.orchestrator.relationships import historical_relationships
+from services.orchestrator.relationships import historical_relationships, merge_historical_relationships
 
 MEMORY_URL = os.getenv("MEMORY_URL", "http://memory:8000").rstrip("/")
 LEFT_URL = os.getenv("LEFT_URL", "http://left-model:8000").rstrip("/")
@@ -1615,7 +1615,11 @@ async def chat(session_id: str, req: ChatRequest) -> dict[str, Any]:
             escalation_decision=executive_escalation,
         )
         classification = classification.model_copy(update={"repeat_dynamics": repeat_dynamics})
-        relationships = historical_relationships(message=req.message, topic=topic, review=repeat_review)
+        relationships = merge_historical_relationships(
+            heuristic=historical_relationships(message=req.message, topic=topic, review=repeat_review),
+            proposed=executive.get("historical_relationships", []),
+            allowed_event_ids={str(event.get("id")) for event in transcript if event.get("id")},
+        )
 
         turn_proposals: list[dict[str, Any]] = []
         # Persist the historical relationship separately from repeat posture.

@@ -168,6 +168,7 @@ def _output_example(output_model: type[ModelOutput]) -> str:
             "topic": "stable topic identifier",
             "repeat_escalation": "hold",
             "factual_claims": [{"text": "I was born in Northbridge.", "evidence_refs": ["identity.birthplace"]}],
+            "historical_relationships": [{"prior_event_id": "evt_prior", "relationship": "clarifies", "confidence": 0.8}],
             "mutations": [],
             "memory_writes": [],
         },

@@ -60,7 +60,8 @@ def test_character_continuity_and_reflection(tmp_path: Path):
             ports["memory"],
             {
                 "MEMORY_DATABASE": str(tmp_path / "cognition.db"),
-                "CHARACTER_DIR": str(ROOT / "characters"),
+                "CHARACTER_DIR": str(ROOT / "examples" / "characters"),
+                "KNOWLEDGE_DIR": str(ROOT / "examples" / "knowledge"),
             },
         )
         wait_for(f"http://127.0.0.1:{ports['memory']}/health")

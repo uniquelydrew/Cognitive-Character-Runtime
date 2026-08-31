@@ -42,5 +42,16 @@ def apply_migrations(conn: sqlite3.Connection) -> None:
     current = {row[0] for row in conn.execute("SELECT version FROM schema_migrations")}
     for version, sql in MIGRATIONS:
         if version not in current:
-            conn.executescript(sql)
-            conn.execute("INSERT INTO schema_migrations(version, applied_at) VALUES (?, datetime('now'))", (version,))
+            # ``executescript`` performs its own transaction handling. Put the
+            # DDL and the version marker in one explicit transaction so a crash
+            # can never leave schema changes without its migration marker.
+            try:
+                conn.executescript(
+                    f"BEGIN IMMEDIATE;\n{sql}\n"
+                    f"INSERT INTO schema_migrations(version, applied_at) VALUES ({version}, datetime('now'));\n"
+                    "COMMIT;"
+                )
+            except sqlite3.Error:
+                if conn.in_transaction:
+                    conn.rollback()
+                raise
