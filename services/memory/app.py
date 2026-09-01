@@ -6,35 +6,46 @@ import re
 import sqlite3
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from yaml.tokens import AliasToken
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import Response
-from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, Field, ValidationError
 
 from services.common import (
     CharacterDocument,
-    EpistemicType,
     EventRecord,
     GeneralKnowledgeRecord,
     KnowledgeCatalog,
     KnowledgeClassification,
     MemoryRecord,
-    MutationOperation,
-    MutationProposal,
     ValidatedMutation,
 )
 from services.memory.migrations import apply_migrations
+from services.memory.models import (
+    KnowledgeCatalogRequest,
+    ProfileDiffRequest,
+    ProfileImportRequest,
+    ReflectionRetryClaim,
+    ReflectionRetrySchedule,
+)
+from services.memory.mutations import (
+    MutationBatch,
+    TurnCommit,
+    apply_mutations as apply_mutation_batch,
+    validate_proposal,
+)
+from services.memory.profiles import ProfileStore
 from services.memory.records import (
     add_event as store_event,
     add_memory as store_memory,
     get_memories as query_memories,
     interaction_history as query_interaction_history,
 )
+from services.memory.sessions import SessionCreate, SessionStore
+from services.memory.snapshots import SnapshotStore, diff_display_value, snapshot_diff
 from services.memory.storage import connection, now_iso
 
 DB_PATH = Path(os.getenv("MEMORY_DATABASE", "/data/cognition.db"))
@@ -60,222 +71,28 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title="Character Memory Service", version="0.1.0", lifespan=lifespan)
 
 
-class ProfileImportRequest(BaseModel):
-    """YAML submitted by Profile Studio for a source or full snapshot import."""
-
-    yaml: str = Field(min_length=1, max_length=5_000_000)
-
-
-class ProfileDiffRequest(BaseModel):
-    """An earlier exported snapshot to compare with the current profile state."""
-
-    yaml: str = Field(min_length=1, max_length=5_000_000)
-
-
-class KnowledgeCatalogRequest(BaseModel):
-    """A complete general-knowledge catalog submitted by Knowledge Studio."""
-
-    yaml: str = Field(min_length=1, max_length=5_000_000)
-
-
-class ReflectionRetrySchedule(BaseModel):
-    """A safe, bounded explanation for a reflection queued after close."""
-
-    error: str = Field(min_length=1, max_length=1_000)
-
-
-class ReflectionRetryClaim(BaseModel):
-    lease_seconds: int = Field(default=300, ge=30, le=3_600)
-
-
-class SnapshotModel(BaseModel):
-    """Strict, JSON-safe import contract for data that bypasses normal APIs."""
-
-    model_config = {"extra": "forbid"}
-
-
-def _validate_timestamp(value: str) -> str:
-    try:
-        datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except (AttributeError, ValueError) as exc:
-        raise ValueError("must be an ISO-8601 timestamp") from exc
-    return value
-
-
-def _validate_optional_timestamp(value: str | None) -> str | None:
-    return _validate_timestamp(value) if value is not None else None
-
-
-class SnapshotCharacterMeta(SnapshotModel):
-    created_at: str
-    updated_at: str
-
-    _created_at = field_validator("created_at")(_validate_timestamp)
-    _updated_at = field_validator("updated_at")(_validate_timestamp)
-
-
-class SnapshotBelief(SnapshotModel):
-    value: Any
-    confidence: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
-    epistemic_type: EpistemicType
-    evidence: list[str] = Field(default_factory=list, max_length=100)
-    revision: int = Field(ge=1)
-
-
-class SnapshotGoal(SnapshotModel):
-    id: str = Field(min_length=1, max_length=120)
-    character_id: str
-    goal: str = Field(min_length=1, max_length=4_000)
-    status: str = Field(min_length=1, max_length=120)
-    metadata: dict[str, Any] = Field(default_factory=dict)
-    created_at: str
-    updated_at: str
-
-    _created_at = field_validator("created_at")(_validate_timestamp)
-    _updated_at = field_validator("updated_at")(_validate_timestamp)
-
-
-class SnapshotSession(SnapshotModel):
-    id: str = Field(min_length=1, max_length=120)
-    character_id: str
-    status: Literal["open", "closed"]
-    created_at: str
-    closed_at: str | None = None
-
-    _created_at = field_validator("created_at")(_validate_timestamp)
-    _closed_at = field_validator("closed_at")(_validate_optional_timestamp)
-
-
-class SnapshotEvent(SnapshotModel):
-    id: str = Field(min_length=1, max_length=120)
-    character_id: str
-    session_id: str | None = Field(default=None, max_length=120)
-    event_type: str = Field(min_length=1, max_length=120)
-    actor: str | None = Field(default=None, max_length=120)
-    content: str = Field(min_length=1, max_length=8_000)
-    topic: str | None = Field(default=None, max_length=160)
-    metadata: dict[str, Any] = Field(default_factory=dict)
-    created_at: str
-
-    _created_at = field_validator("created_at")(_validate_timestamp)
-
-
-class SnapshotMemory(SnapshotModel):
-    id: str = Field(min_length=1, max_length=120)
-    character_id: str
-    kind: str = Field(min_length=1, max_length=120)
-    topic: str | None = Field(default=None, max_length=160)
-    content: str = Field(min_length=1, max_length=8_000)
-    epistemic_type: EpistemicType
-    confidence: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
-    salience: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
-    source_event_ids: list[str] = Field(default_factory=list, max_length=200)
-    status: Literal["active", "superseded"]
-    superseded_by: str | None = Field(default=None, max_length=120)
-    metadata: dict[str, Any] = Field(default_factory=dict)
-    created_at: str
-    updated_at: str
-
-    _created_at = field_validator("created_at")(_validate_timestamp)
-    _updated_at = field_validator("updated_at")(_validate_timestamp)
-
-
-class SnapshotEventLink(SnapshotModel):
-    id: str = Field(min_length=1, max_length=120)
-    character_id: str
-    from_event_id: str = Field(min_length=1, max_length=120)
-    to_event_id: str = Field(min_length=1, max_length=120)
-    relationship: str = Field(min_length=1, max_length=120)
-    evidence: list[str] = Field(default_factory=list, max_length=100)
-    created_at: str
-
-    _created_at = field_validator("created_at")(_validate_timestamp)
-
-
-class SnapshotMutationAudit(SnapshotModel):
-    id: str = Field(min_length=1, max_length=120)
-    character_id: str
-    proposal: MutationProposal
-    status: Literal["allowed", "versioned", "rejected"]
-    reason: str = Field(max_length=4_000)
-    created_at: str
-
-    _created_at = field_validator("created_at")(_validate_timestamp)
-
-
-class SnapshotBeliefHistory(SnapshotModel):
-    id: str = Field(min_length=1, max_length=120)
-    character_id: str
-    key: str = Field(min_length=1, max_length=160)
-    old_value: Any = None
-    new_value: Any
-    confidence: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
-    evidence: list[str] = Field(default_factory=list, max_length=100)
-    reason: str = Field(max_length=4_000)
-    created_at: str
-
-    _created_at = field_validator("created_at")(_validate_timestamp)
-
-
-class SnapshotState(SnapshotModel):
-    mutable_state: dict[str, Any]
-    beliefs: dict[str, SnapshotBelief]
-    goals: list[SnapshotGoal] = Field(default_factory=list, max_length=50_000)
-
-
-class SnapshotRuntime(SnapshotModel):
-    character: SnapshotCharacterMeta
-    state: SnapshotState
-    memories: list[SnapshotMemory] = Field(default_factory=list, max_length=50_000)
-    sessions: list[SnapshotSession] = Field(default_factory=list, max_length=50_000)
-    events: list[SnapshotEvent] = Field(default_factory=list, max_length=50_000)
-    event_links: list[SnapshotEventLink] = Field(default_factory=list, max_length=50_000)
-    mutation_audit: list[SnapshotMutationAudit] = Field(default_factory=list, max_length=50_000)
-    belief_history: list[SnapshotBeliefHistory] = Field(default_factory=list, max_length=50_000)
-
-    @model_validator(mode="after")
-    def validate_references_and_json(self) -> "SnapshotRuntime":
-        collections = {
-            "goals": self.state.goals,
-            "memories": self.memories,
-            "sessions": self.sessions,
-            "events": self.events,
-            "event_links": self.event_links,
-            "mutation_audit": self.mutation_audit,
-            "belief_history": self.belief_history,
-        }
-        for label, records in collections.items():
-            ids = [record.id for record in records]
-            if len(ids) != len(set(ids)):
-                raise ValueError(f"{label} contains duplicate IDs")
-        event_ids = {record.id for record in self.events}
-        session_ids = {record.id for record in self.sessions}
-        memory_ids = {record.id for record in self.memories}
-        if any(record.session_id and record.session_id not in session_ids for record in self.events):
-            raise ValueError("events reference sessions not included in the snapshot")
-        if any(
-            event_id not in event_ids
-            for record in self.memories
-            for event_id in record.source_event_ids
-        ):
-            raise ValueError("memories reference events not included in the snapshot")
-        if any(record.superseded_by and record.superseded_by not in memory_ids for record in self.memories):
-            raise ValueError("memories reference a replacement not included in the snapshot")
-        if any(
-            record.from_event_id not in event_ids or record.to_event_id not in event_ids
-            for record in self.event_links
-        ):
-            raise ValueError("event links reference events not included in the snapshot")
-        try:
-            json.dumps(self.model_dump(mode="json"), allow_nan=False)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("snapshot contains a value that cannot be stored as JSON") from exc
-        return self
-
-
 def db(*, before_commit: Any | None = None, on_abort: Any | None = None):
     """Compatibility façade while routes migrate to the storage module."""
     return connection(DB_PATH, before_commit=before_commit, on_abort=on_abort)
+
+
+def _profiles() -> ProfileStore:
+    """Build the source-backed profile store from the current testable settings."""
+
+    return ProfileStore(
+        db=db,
+        character_dir=CHARACTER_DIR,
+        profile_id_re=PROFILE_ID_RE,
+        snapshot_format=SNAPSHOT_FORMAT,
+    )
+
+
+def _sessions() -> SessionStore:
+    return SessionStore(db=db)
+
+
+def _snapshots() -> SnapshotStore:
+    return SnapshotStore(db=db, profiles=_profiles(), snapshot_format=SNAPSHOT_FORMAT)
 
 
 def init_db() -> None:
@@ -436,16 +253,7 @@ def init_db() -> None:
 
 
 def load_character_files() -> None:
-    if not CHARACTER_DIR.exists():
-        return
-    for path in sorted(CHARACTER_DIR.glob("*.yaml")):
-        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-        if "biography_file" in raw:
-            bio_path = _safe_biography_path(path, raw.pop("biography_file"))
-            if bio_path.exists():
-                raw["biography"] = bio_path.read_text(encoding="utf-8").strip()
-        char = CharacterDocument.model_validate(raw)
-        upsert_character(char, initialize=True)
+    _profiles().load_character_files()
 
 
 def _validate_knowledge_taxonomy(
@@ -546,101 +354,35 @@ def load_knowledge_files() -> None:
 
 
 def profile_path(character_id: str) -> Path:
-    """Return the canonical YAML path, rejecting traversal and unstable IDs."""
-
-    if not PROFILE_ID_RE.fullmatch(character_id):
-        raise HTTPException(
-            422,
-            "Character IDs must start with a lowercase letter and use only lowercase letters, numbers, _ or -.",
-        )
-    return CHARACTER_DIR / f"{character_id}.yaml"
+    return _profiles().profile_path(character_id)
 
 
 def _safe_biography_path(profile: Path, raw_path: Any) -> Path:
-    """Allow legacy sidecar biographies without allowing profile-file traversal."""
-
-    if not isinstance(raw_path, str) or not raw_path.strip():
-        raise HTTPException(422, "biography_file must be a non-empty relative path.")
-    root = profile.parent.resolve()
-    candidate = (root / raw_path).resolve()
-    if candidate != root and root not in candidate.parents:
-        raise HTTPException(422, "biography_file must stay inside the character source directory.")
-    return candidate
+    return ProfileStore.safe_biography_path(profile, raw_path)
 
 
 def _character_source_text(char: CharacterDocument) -> str:
-    return yaml.safe_dump(
-        char.model_dump(mode="json", exclude_none=True),
-        allow_unicode=True,
-        sort_keys=False,
-    )
+    return ProfileStore.character_source_text(char)
 
 
 def _stage_character_source(char: CharacterDocument) -> tuple[Path, Path]:
-    """Write a validated source into a sibling staging file for atomic replacement."""
-
-    path = profile_path(char.id)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(f".yaml.{uuid.uuid4().hex}.tmp")
-    try:
-        temporary.write_text(_character_source_text(char), encoding="utf-8")
-    except OSError as exc:
-        raise HTTPException(503, "The canonical profile source could not be saved.") from exc
-    return path, temporary
+    return _profiles().stage_character_source(char)
 
 
 def _restore_source_bytes(path: Path, original: bytes | None) -> None:
-    """Compensate a failed cross-store snapshot transaction without silent drift."""
-
-    try:
-        if original is None:
-            if path.exists():
-                path.unlink()
-            return
-        temporary = path.with_suffix(f".yaml.{uuid.uuid4().hex}.rollback")
-        temporary.write_bytes(original)
-        temporary.replace(path)
-    except OSError as exc:
-        raise RuntimeError("Could not restore the canonical source after a failed snapshot import.") from exc
+    ProfileStore.restore_source_bytes(path, original)
 
 
 def write_character_source(char: CharacterDocument) -> Path:
-    """Atomically persist the validated profile that bootstraps the runtime."""
-
-    path, temporary = _stage_character_source(char)
-    try:
-        temporary.replace(path)
-    except OSError as exc:
-        raise HTTPException(503, "The canonical profile source could not be saved.") from exc
-    return path
+    return _profiles().write_character_source(char)
 
 
 def profile_summary(char: CharacterDocument) -> dict[str, Any]:
-    identity = char.identity
-    return {
-        "id": char.id,
-        "name": str(identity.get("name", char.id)),
-        "occupation": str(identity.get("occupation", "")),
-        "faction": str(identity.get("faction", "")),
-        "source_file": f"{char.id}.yaml",
-    }
+    return ProfileStore.profile_summary(char)
 
 
 def read_character_source(character_id: str) -> CharacterDocument:
-    """Read the editable canonical document rather than a runtime projection."""
-
-    path = profile_path(character_id)
-    if not path.exists():
-        raise HTTPException(404, "Canonical profile source was not found.")
-    try:
-        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-        if "biography_file" in raw:
-            bio_path = _safe_biography_path(path, raw.pop("biography_file"))
-            if bio_path.exists():
-                raw["biography"] = bio_path.read_text(encoding="utf-8").strip()
-        return CharacterDocument.model_validate(raw)
-    except (OSError, yaml.YAMLError, ValueError) as exc:
-        raise HTTPException(422, "Canonical profile source is not a valid character document.") from exc
+    return _profiles().read_character_source(character_id)
 
 
 def upsert_character(
@@ -649,74 +391,16 @@ def upsert_character(
     *,
     conn: sqlite3.Connection | None = None,
 ) -> None:
-    """Upsert a runtime primer, optionally inside a caller-owned transaction."""
-
-    if conn is None:
-        with db() as owned_connection:
-            upsert_character(char, initialize=initialize, conn=owned_connection)
-        return
-    ts = now_iso()
-    exists = conn.execute("SELECT 1 FROM characters WHERE id=?", (char.id,)).fetchone()
-    conn.execute(
-        """
-        INSERT INTO characters(id, document_json, created_at, updated_at)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET document_json=excluded.document_json, updated_at=excluded.updated_at
-        """,
-        (char.id, char.model_dump_json(), ts, ts),
-    )
-    if initialize and not exists:
-        for key, value in char.mutable_state.items():
-            conn.execute(
-                "INSERT OR REPLACE INTO mutable_state VALUES (?, ?, ?, ?)",
-                (char.id, key, json.dumps(value), ts),
-            )
-        for key, value in char.beliefs.items():
-            conn.execute(
-                "INSERT OR REPLACE INTO beliefs VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (char.id, key, json.dumps(value), 1.0, EpistemicType.BELIEF.value, "[]", 1, ts),
-            )
-        for goal in char.initial_goals:
-            conn.execute(
-                "INSERT INTO goals VALUES (?, ?, ?, 'active', '{}', ?, ?)",
-                (f"goal_{uuid.uuid4().hex}", char.id, goal, ts, ts),
-            )
+    _profiles().upsert_character(char, initialize=initialize, conn=conn)
 
 
 def persist_profile_and_runtime(profile: CharacterDocument, *, initialize: bool) -> None:
-    """Commit profile YAML and its DB primer together, with source rollback on failure."""
-
-    path, temporary = _stage_character_source(profile)
-    original = path.read_bytes() if path.exists() else None
-    source_replaced = False
-
-    def commit_source() -> None:
-        nonlocal source_replaced
-        try:
-            temporary.replace(path)
-            source_replaced = True
-        except OSError as exc:
-            raise HTTPException(503, "The canonical profile source could not be saved.") from exc
-
-    def abort_source() -> None:
-        try:
-            temporary.unlink(missing_ok=True)
-        except OSError:
-            pass
-        if source_replaced:
-            _restore_source_bytes(path, original)
-
-    try:
-        with db(before_commit=commit_source, on_abort=abort_source) as conn:
-            upsert_character(profile, initialize=initialize, conn=conn)
-    except Exception:
-        # If validation or a DB operation failed before the commit hook, the
-        # staging file has no authority and must not accumulate on disk.
-        try:
-            temporary.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise
+    # Preserve the injectable app-level seam used to verify file/DB rollback.
+    _profiles().persist_profile_and_runtime(
+        profile,
+        initialize=initialize,
+        upsert=upsert_character,
+    )
 
 
 
@@ -727,9 +411,7 @@ def health() -> dict[str, str]:
 
 @app.get("/characters", response_model=list[CharacterDocument])
 def list_characters() -> list[CharacterDocument]:
-    with db() as conn:
-        rows = conn.execute("SELECT document_json FROM characters ORDER BY id").fetchall()
-    return [CharacterDocument.model_validate_json(r["document_json"]) for r in rows]
+    return _profiles().list_characters()
 
 
 @app.get("/profiles")
@@ -788,133 +470,15 @@ def update_profile(character_id: str, profile: CharacterDocument) -> dict[str, A
 
 @app.get("/characters/{character_id}")
 def get_character(character_id: str) -> dict[str, Any]:
-    with db() as conn:
-        row = conn.execute("SELECT document_json FROM characters WHERE id=?", (character_id,)).fetchone()
-        if not row:
-            raise HTTPException(404, "Character not found")
-        char = CharacterDocument.model_validate_json(row["document_json"])
-        mutable = {
-            r["key"]: json.loads(r["value_json"])
-            for r in conn.execute("SELECT key, value_json FROM mutable_state WHERE character_id=?", (character_id,))
-        }
-        beliefs = {
-            r["key"]: {
-                "value": json.loads(r["value_json"]),
-                "confidence": r["confidence"],
-                "epistemic_type": r["epistemic_type"],
-                "evidence": json.loads(r["evidence_json"]),
-                "revision": r["revision"],
-            }
-            for r in conn.execute("SELECT * FROM beliefs WHERE character_id=?", (character_id,))
-        }
-        goals = [dict(r) for r in conn.execute("SELECT * FROM goals WHERE character_id=? ORDER BY created_at", (character_id,))]
-    return {"character": char.model_dump(), "mutable_state": mutable, "beliefs": beliefs, "goals": goals}
+    return _profiles().get_character(character_id)
 
 
 def _snapshot_runtime(character_id: str) -> dict[str, Any]:
-    """Return every durable runtime record in a readable, diff-friendly shape."""
-
-    state = get_character(character_id)
-    with db() as conn:
-        character = conn.execute(
-            "SELECT created_at, updated_at FROM characters WHERE id=?", (character_id,)
-        ).fetchone()
-        if not character:
-            raise HTTPException(404, "Character not found")
-        sessions = [dict(row) for row in conn.execute(
-            "SELECT * FROM sessions WHERE character_id=? ORDER BY created_at, rowid", (character_id,)
-        )]
-        event_rows = conn.execute(
-            "SELECT * FROM events WHERE character_id=? ORDER BY created_at, rowid", (character_id,)
-        ).fetchall()
-        memory_rows = conn.execute(
-            "SELECT * FROM memories WHERE character_id=? ORDER BY created_at, rowid", (character_id,)
-        ).fetchall()
-        goal_rows = conn.execute(
-            "SELECT * FROM goals WHERE character_id=? ORDER BY created_at, rowid", (character_id,)
-        ).fetchall()
-        link_rows = conn.execute(
-            "SELECT * FROM event_links WHERE character_id=? ORDER BY created_at, rowid", (character_id,)
-        ).fetchall()
-        mutation_rows = conn.execute(
-            "SELECT * FROM mutation_audit WHERE character_id=? ORDER BY created_at, rowid", (character_id,)
-        ).fetchall()
-        belief_history_rows = conn.execute(
-            "SELECT * FROM belief_history WHERE character_id=? ORDER BY created_at, rowid", (character_id,)
-        ).fetchall()
-
-    return {
-        "character": dict(character),
-        "state": {
-            "mutable_state": state["mutable_state"],
-            "beliefs": state["beliefs"],
-            "goals": [
-                {
-                    **{key: row[key] for key in row.keys() if key != "metadata_json"},
-                    "metadata": json.loads(row["metadata_json"]),
-                }
-                for row in goal_rows
-            ],
-        },
-        "memories": [
-            {
-                **{
-                    key: row[key]
-                    for key in row.keys()
-                    if key not in {"source_event_ids_json", "metadata_json"}
-                },
-                "source_event_ids": json.loads(row["source_event_ids_json"]),
-                "metadata": json.loads(row["metadata_json"]),
-            }
-            for row in memory_rows
-        ],
-        "sessions": sessions,
-        "events": [
-            {
-                **{key: row[key] for key in row.keys() if key != "metadata_json"},
-                "metadata": json.loads(row["metadata_json"]),
-            }
-            for row in event_rows
-        ],
-        "event_links": [
-            {
-                **{key: row[key] for key in row.keys() if key != "evidence_json"},
-                "evidence": json.loads(row["evidence_json"]),
-            }
-            for row in link_rows
-        ],
-        "mutation_audit": [
-            {
-                **{key: row[key] for key in row.keys() if key != "proposal_json"},
-                "proposal": json.loads(row["proposal_json"]),
-            }
-            for row in mutation_rows
-        ],
-        "belief_history": [
-            {
-                **{
-                    key: row[key]
-                    for key in row.keys()
-                    if key not in {"old_value_json", "new_value_json", "evidence_json"}
-                },
-                "old_value": json.loads(row["old_value_json"]) if row["old_value_json"] is not None else None,
-                "new_value": json.loads(row["new_value_json"]),
-                "evidence": json.loads(row["evidence_json"]),
-            }
-            for row in belief_history_rows
-        ],
-    }
+    return _profiles().snapshot_runtime(character_id)
 
 
 def character_snapshot(character_id: str) -> dict[str, Any]:
-    """Build a portable YAML payload containing primer plus learned runtime state."""
-
-    source = read_character_source(character_id)
-    return {
-        "format": SNAPSHOT_FORMAT,
-        "source": source.model_dump(mode="json", exclude_none=True),
-        "runtime": _snapshot_runtime(character_id),
-    }
+    return _profiles().character_snapshot(character_id)
 
 
 def _knowledge_catalog_text(catalog: KnowledgeCatalog) -> str:
@@ -1228,274 +792,27 @@ def character_knowledge(
 
 
 def _safe_load_uploaded_yaml(source_text: str) -> dict[str, Any]:
-    """Reject parser-amplification inputs before loading a user-supplied YAML file."""
-
-    if len(source_text.encode("utf-8")) > 5_000_000:
-        raise HTTPException(413, "Uploaded YAML exceeds the 5 MB import limit.")
-    try:
-        alias_count = 0
-        token_count = 0
-        for token in yaml.scan(source_text):
-            token_count += 1
-            alias_count += isinstance(token, AliasToken)
-            if alias_count > 64 or token_count > 250_000:
-                raise HTTPException(422, "Uploaded YAML is too structurally complex to import safely.")
-        loaded = yaml.safe_load(source_text)
-    except HTTPException:
-        raise
-    except yaml.YAMLError as exc:
-        raise HTTPException(422, "Uploaded YAML could not be parsed.") from exc
-    if not isinstance(loaded, dict):
-        raise HTTPException(422, "Uploaded YAML must contain a mapping at its top level.")
-    return loaded
+    return _snapshots().safe_load_uploaded_yaml(source_text)
 
 
 def _snapshot_import_payload(source_text: str) -> tuple[CharacterDocument, dict[str, Any] | None]:
-    """Accept either a source YAML primer or a complete exported snapshot."""
-
-    loaded = _safe_load_uploaded_yaml(source_text)
-
-    if loaded.get("format") != SNAPSHOT_FORMAT:
-        try:
-            return CharacterDocument.model_validate(loaded), None
-        except ValueError as exc:
-            raise HTTPException(422, "Uploaded YAML is not a valid character source document.") from exc
-
-    try:
-        source = CharacterDocument.model_validate(loaded.get("source"))
-    except ValueError as exc:
-        raise HTTPException(422, "Snapshot source is not a valid character document.") from exc
-    try:
-        runtime_model = SnapshotRuntime.model_validate(loaded.get("runtime"))
-    except (TypeError, ValueError, ValidationError) as exc:
-        raise HTTPException(422, f"Snapshot runtime is invalid: {exc}") from exc
-    for label, records in {
-        "goals": runtime_model.state.goals,
-        "memories": runtime_model.memories,
-        "sessions": runtime_model.sessions,
-        "events": runtime_model.events,
-        "event_links": runtime_model.event_links,
-        "mutation_audit": runtime_model.mutation_audit,
-        "belief_history": runtime_model.belief_history,
-    }.items():
-        if any(record.character_id != source.id for record in records):
-            raise HTTPException(422, f"Snapshot {label} contains records for another character.")
-    return source, runtime_model.model_dump(mode="json")
+    return _snapshots().import_payload(source_text)
 
 
 def _restore_snapshot(source: CharacterDocument, runtime: dict[str, Any]) -> None:
-    """Atomically replace a character's runtime with an exported snapshot."""
-
-    character_id = source.id
-    profile_path(character_id)
-    try:
-        normalized_runtime = SnapshotRuntime.model_validate(runtime).model_dump(mode="json")
-    except (TypeError, ValueError, ValidationError) as exc:
-        raise HTTPException(422, f"Snapshot runtime is invalid: {exc}") from exc
-    state = normalized_runtime["state"]
-    mutable_state = state["mutable_state"]
-    beliefs = state["beliefs"]
-    character_meta = normalized_runtime["character"]
-    goals = state["goals"]
-    memories = normalized_runtime["memories"]
-    sessions = normalized_runtime["sessions"]
-    events = normalized_runtime["events"]
-    links = normalized_runtime["event_links"]
-    mutations = normalized_runtime["mutation_audit"]
-    belief_history = normalized_runtime["belief_history"]
-
-    # Stage source first, then replace it immediately before the database commit.
-    # If either side fails, the database rolls back and the prior YAML is restored.
-    path, staged_source = _stage_character_source(source)
-    original_source = path.read_bytes() if path.exists() else None
-    source_replaced = False
-
-    def replace_source_before_commit() -> None:
-        nonlocal source_replaced
-        staged_source.replace(path)
-        source_replaced = True
-
-    def compensate_source() -> None:
-        if source_replaced:
-            _restore_source_bytes(path, original_source)
-        elif staged_source.exists():
-            staged_source.unlink()
-
-    ts = now_iso()
-    with db(before_commit=replace_source_before_commit, on_abort=compensate_source) as conn:
-        for table in (
-            "event_links",
-            "mutation_audit",
-            "belief_history",
-            "memories",
-            "events",
-            "sessions",
-            "goals",
-            "beliefs",
-            "mutable_state",
-        ):
-            conn.execute(f"DELETE FROM {table} WHERE character_id=?", (character_id,))
-        conn.execute("DELETE FROM characters WHERE id=?", (character_id,))
-        conn.execute(
-            "INSERT INTO characters(id, document_json, created_at, updated_at) VALUES (?, ?, ?, ?)",
-            (
-                character_id,
-                source.model_dump_json(),
-                str(character_meta.get("created_at") or ts),
-                str(character_meta.get("updated_at") or ts),
-            ),
-        )
-        for key, value in mutable_state.items():
-            conn.execute(
-                "INSERT INTO mutable_state(character_id, key, value_json, updated_at) VALUES (?, ?, ?, ?)",
-                (character_id, str(key), json.dumps(value), ts),
-            )
-        for key, belief in beliefs.items():
-            data = belief
-            conn.execute(
-                """
-                INSERT INTO beliefs(character_id, key, value_json, confidence, epistemic_type, evidence_json, revision, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    character_id,
-                    str(key),
-                    json.dumps(data.get("value")),
-                    float(data.get("confidence", 1.0)),
-                    str(data.get("epistemic_type", EpistemicType.BELIEF.value)),
-                    json.dumps(data.get("evidence", [])),
-                    int(data.get("revision", 1)),
-                    str(data.get("updated_at") or ts),
-                ),
-            )
-        for row in goals:
-            conn.execute(
-                "INSERT INTO goals VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (
-                    str(row.get("id") or f"goal_{uuid.uuid4().hex}"), character_id, str(row.get("goal", "")),
-                    str(row.get("status", "active")), json.dumps(row.get("metadata", {})),
-                    str(row.get("created_at") or ts), str(row.get("updated_at") or ts),
-                ),
-            )
-        for row in sessions:
-            conn.execute(
-                "INSERT INTO sessions(id, character_id, status, created_at, closed_at) VALUES (?, ?, ?, ?, ?)",
-                (
-                    str(row.get("id") or f"sess_{uuid.uuid4().hex}"), character_id, str(row.get("status", "open")),
-                    str(row.get("created_at") or ts), row.get("closed_at"),
-                ),
-            )
-        for row in events:
-            conn.execute(
-                """
-                INSERT INTO events(id, character_id, session_id, event_type, actor, content, topic, metadata_json, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    str(row.get("id") or f"evt_{uuid.uuid4().hex}"), character_id, row.get("session_id"),
-                    str(row.get("event_type", "imported_event")), row.get("actor"), str(row.get("content", "")),
-                    row.get("topic"), json.dumps(row.get("metadata", {})), str(row.get("created_at") or ts),
-                ),
-            )
-        for row in memories:
-            conn.execute(
-                """
-                INSERT INTO memories(
-                    id, character_id, kind, topic, content, epistemic_type, confidence, salience,
-                    source_event_ids_json, status, superseded_by, metadata_json, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    str(row.get("id") or f"mem_{uuid.uuid4().hex}"), character_id, str(row.get("kind", "self_history")),
-                    row.get("topic"), str(row.get("content", "")), str(row.get("epistemic_type", "observation")),
-                    float(row.get("confidence", 1.0)), float(row.get("salience", 0.5)),
-                    json.dumps(row.get("source_event_ids", [])), str(row.get("status", "active")),
-                    row.get("superseded_by"), json.dumps(row.get("metadata", {})),
-                    str(row.get("created_at") or ts), str(row.get("updated_at") or ts),
-                ),
-            )
-        for row in links:
-            conn.execute(
-                "INSERT INTO event_links VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (
-                    str(row.get("id") or f"lnk_{uuid.uuid4().hex}"), character_id,
-                    str(row.get("from_event_id", "")), str(row.get("to_event_id", "")),
-                    str(row.get("relationship", "related_to")), json.dumps(row.get("evidence", [])),
-                    str(row.get("created_at") or ts),
-                ),
-            )
-        for row in mutations:
-            conn.execute(
-                "INSERT INTO mutation_audit VALUES (?, ?, ?, ?, ?, ?)",
-                (
-                    str(row.get("id") or f"mut_{uuid.uuid4().hex}"), character_id,
-                    json.dumps(row.get("proposal", {})), str(row.get("status", "allowed")),
-                    str(row.get("reason", "Imported snapshot record.")), str(row.get("created_at") or ts),
-                ),
-            )
-        for row in belief_history:
-            conn.execute(
-                "INSERT INTO belief_history VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    str(row.get("id") or f"bh_{uuid.uuid4().hex}"), character_id, str(row.get("key", "")),
-                    json.dumps(row["old_value"]) if row.get("old_value") is not None else None,
-                    json.dumps(row.get("new_value")), float(row.get("confidence", 1.0)),
-                    json.dumps(row.get("evidence", [])), str(row.get("reason", "Imported snapshot record.")),
-                    str(row.get("created_at") or ts),
-                ),
-            )
-
+    _snapshots().restore(source, runtime)
 
 def _diff_display_value(value: Any) -> Any:
-    if isinstance(value, str) and len(value) > 400:
-        return value[:397] + "..."
-    if isinstance(value, list) and len(value) > 12:
-        return {"items": len(value), "preview": [_diff_display_value(item) for item in value[:12]]}
-    if isinstance(value, dict) and len(value) > 20:
-        keys = sorted(value)[:20]
-        return {key: _diff_display_value(value[key]) for key in keys} | {"_truncated_keys": len(value) - len(keys)}
-    return value
+    return diff_display_value(value)
 
 
-def _snapshot_diff(before: Any, after: Any, path: str = "", changes: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
-    """Produce a bounded, ID-aware structural diff suitable for profile review."""
-
-    changes = changes if changes is not None else []
-    if len(changes) >= 250:
-        return changes
-    if isinstance(before, dict) and isinstance(after, dict):
-        for key in sorted(set(before) | set(after)):
-            child_path = f"{path}.{key}" if path else key
-            if key not in before:
-                changes.append({"kind": "added", "path": child_path, "after": _diff_display_value(after[key])})
-            elif key not in after:
-                changes.append({"kind": "removed", "path": child_path, "before": _diff_display_value(before[key])})
-            else:
-                _snapshot_diff(before[key], after[key], child_path, changes)
-            if len(changes) >= 250:
-                break
-        return changes
-    if isinstance(before, list) and isinstance(after, list):
-        if all(isinstance(item, dict) and "id" in item for item in before + after):
-            before_by_id = {str(item["id"]): item for item in before}
-            after_by_id = {str(item["id"]): item for item in after}
-            return _snapshot_diff(before_by_id, after_by_id, path, changes)
-        if before != after:
-            changes.append({
-                "kind": "changed",
-                "path": path,
-                "before": _diff_display_value(before),
-                "after": _diff_display_value(after),
-            })
-        return changes
-    if before != after:
-        changes.append({
-            "kind": "changed",
-            "path": path,
-            "before": _diff_display_value(before),
-            "after": _diff_display_value(after),
-        })
-    return changes
+def _snapshot_diff(
+    before: Any,
+    after: Any,
+    path: str = "",
+    changes: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    return snapshot_diff(before, after, path, changes)
 
 
 @app.get("/profiles/{character_id}/export")
@@ -1551,32 +868,14 @@ def import_profile(request: ProfileImportRequest) -> dict[str, Any]:
     return create_profile(source)
 
 
-class SessionCreate(BaseModel):
-    character_id: str
-
-
 @app.post("/sessions")
 def create_session(req: SessionCreate) -> dict[str, Any]:
-    sid = f"sess_{uuid.uuid4().hex}"
-    ts = now_iso()
-    with db() as conn:
-        exists = conn.execute("SELECT 1 FROM characters WHERE id=?", (req.character_id,)).fetchone()
-        if not exists:
-            raise HTTPException(404, "Character not found")
-        conn.execute(
-            "INSERT INTO sessions(id, character_id, status, created_at) VALUES (?, ?, 'open', ?)",
-            (sid, req.character_id, ts),
-        )
-    return {"id": sid, "character_id": req.character_id, "status": "open", "created_at": ts}
+    return _sessions().create(req)
 
 
 @app.get("/sessions/{session_id}")
 def get_session(session_id: str) -> dict[str, Any]:
-    with db() as conn:
-        row = conn.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()
-    if not row:
-        raise HTTPException(404, "Session not found")
-    return dict(row)
+    return _sessions().get(session_id)
 
 
 @app.get("/sessions/{session_id}/events")
@@ -1584,186 +883,41 @@ def session_events(
     session_id: str,
     limit: int = Query(MAX_SESSION_EVENTS_RETURNED, ge=1, le=MAX_SESSION_EVENTS_RETURNED),
 ) -> list[dict[str, Any]]:
-    with db() as conn:
-        session = conn.execute("SELECT 1 FROM sessions WHERE id=?", (session_id,)).fetchone()
-        if not session:
-            raise HTTPException(404, "Session not found")
-        rows = list(reversed(conn.execute(
-            "SELECT * FROM events WHERE session_id=? ORDER BY created_at DESC, rowid DESC LIMIT ?",
-            (session_id, limit),
-        ).fetchall()))
-    return [
-        {
-            **{k: r[k] for k in r.keys() if k != "metadata_json"},
-            "metadata": json.loads(r["metadata_json"]),
-        }
-        for r in rows
-    ]
+    return _sessions().events(session_id, limit)
 
 
 @app.post("/sessions/{session_id}/close")
 def close_session(session_id: str) -> dict[str, str]:
-    ts = now_iso()
-    with db() as conn:
-        row = conn.execute("SELECT status, closed_at FROM sessions WHERE id=?", (session_id,)).fetchone()
-        if not row:
-            raise HTTPException(404, "Session not found")
-        if row["status"] == "closed":
-            return {"id": session_id, "status": "closed", "closed_at": row["closed_at"]}
-        conn.execute("UPDATE sessions SET status='closed', closed_at=? WHERE id=?", (ts, session_id))
-    return {"id": session_id, "status": "closed", "closed_at": ts}
+    return _sessions().close(session_id)
 
 
 def _reflection_job_payload(row: sqlite3.Row) -> dict[str, Any]:
-    return {
-        "session_id": row["session_id"],
-        "character_id": row["character_id"],
-        "status": row["status"],
-        "attempts": int(row["attempts"]),
-        "last_error": row["last_error"],
-        "next_attempt_at": row["next_attempt_at"],
-        "lease_expires_at": row["lease_expires_at"],
-        "completed_at": row["completed_at"],
-        "created_at": row["created_at"],
-        "updated_at": row["updated_at"],
-    }
+    return SessionStore.job_payload(row)
 
 
 @app.post("/reflection-jobs/{session_id}/schedule")
 def schedule_reflection_retry(session_id: str, request: ReflectionRetrySchedule) -> dict[str, Any]:
-    """Persist a close-time reflection failure for asynchronous retry."""
-
-    ts = now_iso()
-    with db() as conn:
-        session = conn.execute(
-            "SELECT character_id FROM sessions WHERE id=?", (session_id,)
-        ).fetchone()
-        if not session:
-            raise HTTPException(404, "Session not found")
-        existing = conn.execute(
-            "SELECT * FROM reflection_jobs WHERE session_id=?", (session_id,)
-        ).fetchone()
-        if existing and existing["status"] == "completed":
-            return {**_reflection_job_payload(existing), "already_completed": True}
-        if existing:
-            conn.execute(
-                """
-                UPDATE reflection_jobs
-                SET status='pending', last_error=?, next_attempt_at=?, lease_expires_at=NULL, updated_at=?
-                WHERE session_id=?
-                """,
-                (request.error, ts, ts, session_id),
-            )
-        else:
-            conn.execute(
-                """
-                INSERT INTO reflection_jobs(
-                    session_id, character_id, status, attempts, last_error, next_attempt_at,
-                    lease_expires_at, completed_at, created_at, updated_at
-                ) VALUES (?, ?, 'pending', 0, ?, ?, NULL, NULL, ?, ?)
-                """,
-                (session_id, session["character_id"], request.error, ts, ts, ts),
-            )
-        row = conn.execute("SELECT * FROM reflection_jobs WHERE session_id=?", (session_id,)).fetchone()
-    return _reflection_job_payload(row)
+    return _sessions().schedule_reflection_retry(session_id, request)
 
 
 @app.post("/reflection-jobs/claim")
 def claim_reflection_retry(request: ReflectionRetryClaim) -> dict[str, Any]:
-    """Atomically lease one due reflection job to a single orchestrator."""
-
-    ts = now_iso()
-    lease_until = (datetime.now(timezone.utc) + timedelta(seconds=request.lease_seconds)).isoformat()
-    with db() as conn:
-        row = conn.execute(
-            """
-            SELECT * FROM reflection_jobs
-            WHERE (status='pending' AND next_attempt_at <= ?)
-               OR (status='running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?)
-            ORDER BY next_attempt_at, created_at
-            LIMIT 1
-            """,
-            (ts, ts),
-        ).fetchone()
-        if not row:
-            return {"job": None}
-        conn.execute(
-            """
-            UPDATE reflection_jobs
-            SET status='running', attempts=attempts + 1, lease_expires_at=?, updated_at=?
-            WHERE session_id=?
-            """,
-            (lease_until, ts, row["session_id"]),
-        )
-        claimed = conn.execute(
-            "SELECT * FROM reflection_jobs WHERE session_id=?", (row["session_id"],)
-        ).fetchone()
-    return {"job": _reflection_job_payload(claimed)}
+    return _sessions().claim_reflection_retry(request)
 
 
 @app.post("/reflection-jobs/{session_id}/complete")
 def complete_reflection_retry(session_id: str) -> dict[str, Any]:
-    """Mark a queued reflection complete without deleting its operational audit."""
-
-    ts = now_iso()
-    with db() as conn:
-        row = conn.execute("SELECT * FROM reflection_jobs WHERE session_id=?", (session_id,)).fetchone()
-        if not row:
-            return {"found": False, "session_id": session_id}
-        conn.execute(
-            """
-            UPDATE reflection_jobs
-            SET status='completed', last_error=NULL, next_attempt_at=?, lease_expires_at=NULL,
-                completed_at=?, updated_at=?
-            WHERE session_id=?
-            """,
-            (ts, ts, ts, session_id),
-        )
-        completed = conn.execute(
-            "SELECT * FROM reflection_jobs WHERE session_id=?", (session_id,)
-        ).fetchone()
-    return {"found": True, **_reflection_job_payload(completed)}
+    return _sessions().complete_reflection_retry(session_id)
 
 
 @app.post("/reflection-jobs/{session_id}/reschedule")
 def reschedule_reflection_retry(session_id: str, request: ReflectionRetrySchedule) -> dict[str, Any]:
-    """Release a failed lease with bounded exponential backoff."""
-
-    ts = now_iso()
-    with db() as conn:
-        row = conn.execute("SELECT * FROM reflection_jobs WHERE session_id=?", (session_id,)).fetchone()
-        if not row:
-            raise HTTPException(404, "Reflection retry job not found")
-        attempts = max(int(row["attempts"]), 1)
-        delay_seconds = min(30 * (2 ** min(attempts - 1, 7)), 3_600)
-        next_attempt = (datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)).isoformat()
-        conn.execute(
-            """
-            UPDATE reflection_jobs
-            SET status='pending', last_error=?, next_attempt_at=?, lease_expires_at=NULL, updated_at=?
-            WHERE session_id=?
-            """,
-            (request.error, next_attempt, ts, session_id),
-        )
-        scheduled = conn.execute(
-            "SELECT * FROM reflection_jobs WHERE session_id=?", (session_id,)
-        ).fetchone()
-    return {"backoff_seconds": delay_seconds, **_reflection_job_payload(scheduled)}
+    return _sessions().reschedule_reflection_retry(session_id, request)
 
 
 @app.get("/reflection-jobs")
 def reflection_jobs(limit: int = Query(50, ge=1, le=200)) -> dict[str, Any]:
-    """Expose retry state for the authenticated runtime-status dashboard."""
-
-    with db() as conn:
-        rows = conn.execute(
-            "SELECT * FROM reflection_jobs ORDER BY updated_at DESC LIMIT ?", (limit,)
-        ).fetchall()
-    jobs = [_reflection_job_payload(row) for row in rows]
-    return {
-        "jobs": jobs,
-        "pending_count": sum(job["status"] in {"pending", "running"} for job in jobs),
-    }
+    return _sessions().reflection_jobs(limit)
 
 
 def _add_event(event: EventRecord, conn: sqlite3.Connection) -> EventRecord:
@@ -1810,197 +964,12 @@ def get_memories(
         return query_memories(character_id, topic, limit, conn)
 
 
-def validate_proposal(
-    proposal: MutationProposal,
-    *,
-    allowed_mutable_keys: set[str] | None = None,
-    evidence_event_ids: set[str] | None = None,
-    goal_ids: set[str] | None = None,
-    memory_ids: set[str] | None = None,
-) -> ValidatedMutation:
-    """Apply a narrow state-transition policy to untrusted executive proposals."""
-
-    try:
-        json.dumps(proposal.value, allow_nan=False)
-    except (TypeError, ValueError):
-        return ValidatedMutation(proposal=proposal, status="rejected", reason="Mutation value is not JSON-safe.")
-    evidence = {event_id for event_id in proposal.evidence if event_id}
-    if proposal.evidence and len(evidence) != len(proposal.evidence):
-        return ValidatedMutation(proposal=proposal, status="rejected", reason="Mutation evidence contains blank or duplicate event IDs.")
-    if evidence_event_ids is not None and not evidence.issubset(evidence_event_ids):
-        return ValidatedMutation(proposal=proposal, status="rejected", reason="Mutation evidence must reference this character's recorded events.")
-    if proposal.operation == MutationOperation.UPDATE_CORE:
-        return ValidatedMutation(proposal=proposal, status="rejected", reason="Core biography/identity is immutable at runtime.")
-    if proposal.operation == MutationOperation.SET_MUTABLE_STATE:
-        if not evidence:
-            return ValidatedMutation(proposal=proposal, status="rejected", reason="State revisions require provenance/evidence.")
-        if allowed_mutable_keys is not None and proposal.target not in allowed_mutable_keys:
-            return ValidatedMutation(proposal=proposal, status="rejected", reason="Mutable state target is not declared by this character.")
-        return ValidatedMutation(proposal=proposal, status="versioned", reason="Declared mutable state may change with provenance.")
-    if proposal.operation == MutationOperation.SET_BELIEF:
-        if not evidence:
-            return ValidatedMutation(proposal=proposal, status="rejected", reason="Belief revisions require provenance/evidence.")
-        if proposal.epistemic_type in {EpistemicType.FACT, EpistemicType.OBSERVATION, EpistemicType.SELF_STATEMENT}:
-            return ValidatedMutation(proposal=proposal, status="rejected", reason="A model may not promote conversation evidence to a fact or observation.")
-        return ValidatedMutation(proposal=proposal, status="versioned", reason="Mutable state may change, but revision history is preserved.")
-    if proposal.operation == MutationOperation.ADD_MEMORY:
-        if not evidence:
-            return ValidatedMutation(proposal=proposal, status="rejected", reason="Derived memories require source evidence.")
-        return ValidatedMutation(proposal=proposal, status="allowed", reason="Append-only derived memory is permitted.")
-    if proposal.operation == MutationOperation.ADD_GOAL:
-        if not evidence:
-            return ValidatedMutation(proposal=proposal, status="rejected", reason="New goals require source evidence.")
-        return ValidatedMutation(proposal=proposal, status="allowed", reason="A sourced goal may be added.")
-    if proposal.operation == MutationOperation.UPDATE_GOAL:
-        if not evidence:
-            return ValidatedMutation(proposal=proposal, status="rejected", reason="Goal revisions require source evidence.")
-        if goal_ids is not None and proposal.target not in goal_ids:
-            return ValidatedMutation(proposal=proposal, status="rejected", reason="Goal revision targets an unknown goal.")
-        return ValidatedMutation(proposal=proposal, status="versioned", reason="A sourced goal revision is permitted.")
-    if proposal.operation == MutationOperation.SUPERSEDE_MEMORY:
-        if not evidence:
-            return ValidatedMutation(proposal=proposal, status="rejected", reason="Memory supersession requires source evidence.")
-        if memory_ids is not None and proposal.target not in memory_ids:
-            return ValidatedMutation(proposal=proposal, status="rejected", reason="Memory supersession targets an unknown memory.")
-        return ValidatedMutation(proposal=proposal, status="versioned", reason="A sourced memory supersession is permitted.")
-    if proposal.operation == MutationOperation.LINK_EVENTS:
-        data = proposal.value if isinstance(proposal.value, dict) else {}
-        from_id, to_id = str(data.get("from") or ""), str(data.get("to") or "")
-        if not from_id or not to_id or (evidence_event_ids is not None and ({from_id, to_id} - evidence_event_ids)):
-            return ValidatedMutation(proposal=proposal, status="rejected", reason="Event links must reference recorded events for this character.")
-        return ValidatedMutation(proposal=proposal, status="allowed", reason="Recorded events may be linked.")
-    return ValidatedMutation(proposal=proposal, status="allowed", reason="Operation is permitted by runtime policy.")
-
-
-class MutationBatch(BaseModel):
-    proposals: list[MutationProposal] = Field(default_factory=list)
-
-
-class TurnCommit(BaseModel):
-    """All durable outputs of a successful cognitive turn, committed together."""
-
-    model_config = {"extra": "forbid"}
-
-    character_event: EventRecord
-    memories: list[MemoryRecord] = Field(default_factory=list, max_length=20)
-    proposals: list[MutationProposal] = Field(default_factory=list, max_length=25)
-
-
 def _apply_mutations(
     character_id: str,
     batch: MutationBatch,
     conn: sqlite3.Connection,
 ) -> list[ValidatedMutation]:
-    """Apply already-validated proposals inside a caller-owned transaction."""
-
-    results: list[ValidatedMutation] = []
-    ts = now_iso()
-    character_row = conn.execute("SELECT document_json FROM characters WHERE id=?", (character_id,)).fetchone()
-    if not character_row:
-        raise HTTPException(404, "Character not found")
-    character = CharacterDocument.model_validate_json(character_row["document_json"])
-    allowed_mutable_keys = set(character.mutable_state) | {"topic_defensiveness"}
-    evidence_event_ids = {
-        str(row["id"])
-        for row in conn.execute("SELECT id FROM events WHERE character_id=?", (character_id,))
-    }
-    goal_ids = {
-        str(row["id"])
-        for row in conn.execute("SELECT id FROM goals WHERE character_id=?", (character_id,))
-    }
-    memory_ids = {
-        str(row["id"])
-        for row in conn.execute("SELECT id FROM memories WHERE character_id=?", (character_id,))
-    }
-    for proposal in batch.proposals:
-        checked = validate_proposal(
-            proposal,
-            allowed_mutable_keys=allowed_mutable_keys,
-            evidence_event_ids=evidence_event_ids,
-            goal_ids=goal_ids,
-            memory_ids=memory_ids,
-        )
-        results.append(checked)
-        conn.execute(
-            "INSERT INTO mutation_audit VALUES (?, ?, ?, ?, ?, ?)",
-            (f"mut_{uuid.uuid4().hex}", character_id, proposal.model_dump_json(), checked.status, checked.reason, ts),
-        )
-        if checked.status == "rejected":
-            continue
-
-        if proposal.operation == MutationOperation.SET_MUTABLE_STATE:
-            conn.execute(
-                """
-                INSERT INTO mutable_state(character_id, key, value_json, updated_at) VALUES (?, ?, ?, ?)
-                ON CONFLICT(character_id, key) DO UPDATE SET value_json=excluded.value_json, updated_at=excluded.updated_at
-                """,
-                (character_id, proposal.target, json.dumps(proposal.value), ts),
-            )
-        elif proposal.operation == MutationOperation.SET_BELIEF:
-            old = conn.execute(
-                "SELECT value_json, revision FROM beliefs WHERE character_id=? AND key=?",
-                (character_id, proposal.target),
-            ).fetchone()
-            revision = int(old["revision"]) + 1 if old else 1
-            old_json = old["value_json"] if old else None
-            conn.execute(
-                """
-                INSERT INTO beliefs(character_id, key, value_json, confidence, epistemic_type, evidence_json, revision, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(character_id, key) DO UPDATE SET
-                  value_json=excluded.value_json, confidence=excluded.confidence,
-                  epistemic_type=excluded.epistemic_type, evidence_json=excluded.evidence_json,
-                  revision=excluded.revision, updated_at=excluded.updated_at
-                """,
-                (
-                    character_id, proposal.target, json.dumps(proposal.value), proposal.confidence,
-                    proposal.epistemic_type.value, json.dumps(proposal.evidence), revision, ts,
-                ),
-            )
-            conn.execute(
-                "INSERT INTO belief_history VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    f"bh_{uuid.uuid4().hex}", character_id, proposal.target, old_json,
-                    json.dumps(proposal.value), proposal.confidence, json.dumps(proposal.evidence), proposal.reason, ts,
-                ),
-            )
-        elif proposal.operation == MutationOperation.ADD_MEMORY:
-            conn.execute(
-                """INSERT INTO memories VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', NULL, '{}', ?, ?)""",
-                (
-                    f"mem_{uuid.uuid4().hex}", character_id, proposal.target, proposal.target,
-                    str(proposal.value), proposal.epistemic_type.value, proposal.confidence, 0.6,
-                    json.dumps(proposal.evidence), ts, ts,
-                ),
-            )
-        elif proposal.operation == MutationOperation.ADD_GOAL:
-            conn.execute(
-                "INSERT INTO goals VALUES (?, ?, ?, 'active', '{}', ?, ?)",
-                (f"goal_{uuid.uuid4().hex}", character_id, str(proposal.value), ts, ts),
-            )
-        elif proposal.operation == MutationOperation.UPDATE_GOAL:
-            conn.execute(
-                "UPDATE goals SET status=?, updated_at=? WHERE id=? AND character_id=?",
-                (str(proposal.value), ts, proposal.target, character_id),
-            )
-        elif proposal.operation == MutationOperation.LINK_EVENTS:
-            data = proposal.value if isinstance(proposal.value, dict) else {}
-            from_id, to_id = data.get("from"), data.get("to")
-            relationship = data.get("relationship", "related_to")
-            if from_id and to_id:
-                conn.execute(
-                    """INSERT OR IGNORE INTO event_links VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        f"lnk_{uuid.uuid4().hex}", character_id, from_id, to_id, relationship,
-                        json.dumps(proposal.evidence), ts,
-                    ),
-                )
-        elif proposal.operation == MutationOperation.SUPERSEDE_MEMORY:
-            conn.execute(
-                "UPDATE memories SET status='superseded', superseded_by=?, updated_at=? WHERE id=? AND character_id=?",
-                (str(proposal.value), ts, proposal.target, character_id),
-            )
-    return results
+    return apply_mutation_batch(character_id, batch, conn)
 
 
 @app.post("/mutations/{character_id}")
